@@ -21,8 +21,8 @@ class PushService : FirebaseMessagingService() {
             // The call rings right away; the repository connects to fetch its details.
             "call" -> repository.calls.onIncomingPush(
                 callId = data["callId"] ?: return,
-                from = data["from"] ?: return,
-                fromName = data["fromName"] ?: "Unknown",
+                from = data["callerId"] ?: return,
+                fromName = data["callerName"] ?: "Unknown",
             )
             "call_end" -> repository.calls.onCancelledPush(data["callId"] ?: return)
             else -> runBlocking { repository.syncFromPush() }

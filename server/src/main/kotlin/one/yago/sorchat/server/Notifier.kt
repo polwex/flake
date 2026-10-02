@@ -93,8 +93,9 @@ class FcmNotifier(private val store: Store, credentialsJson: String) : Notifier 
                         is Push.IncomingCall -> {
                             put("type", "call")
                             put("callId", push.callId)
-                            put("from", push.callerId)
-                            put("fromName", push.callerName)
+                            // Not "from": FCM reserves that key (and "google.*", "gcm.*", "message_type", ...).
+                            put("callerId", push.callerId)
+                            put("callerName", push.callerName)
                         }
                         is Push.CallEnded -> {
                             put("type", "call_end")
