@@ -2,6 +2,7 @@ package one.yago.sorchat.app
 
 import android.content.Context
 import androidx.room.AutoMigration
+import androidx.room.ColumnInfo
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Entity
@@ -34,13 +35,38 @@ data class ChatMessage(
     val mediaId: String? = null,
     val mimeType: String? = null,
     val durationMs: Long? = null,
+    /** Files: the original name. */
+    val fileName: String? = null,
+    /** Attachments: size in bytes (known before downloading). */
+    val fileSize: Long? = null,
+    /** Images: pixel size, for laying out the bubble before the image is there. */
+    val width: Int? = null,
+    val height: Int? = null,
+    /** The server no longer has the attachment (expired before it was downloaded). */
+    @ColumnInfo(defaultValue = "0") val unavailable: Boolean = false,
 )
 
 val ChatMessage.isVoice: Boolean get() = mimeType?.startsWith("audio/") == true
+val ChatMessage.isImage: Boolean get() = mimeType?.startsWith("image/") == true
+val ChatMessage.isFile: Boolean get() = mimeType != null && !isVoice && !isImage
+
+/** Has an attachment that isn't on this device (yet). */
+val ChatMessage.needsDownload: Boolean get() = mediaId != null && localPath == null && !fromMe && !unavailable
 
 /** One-line summary for the contact list and notifications. */
-fun ChatMessage.preview(): String =
-    if (isVoice) "🎤 Voice message (${formatDuration(durationMs ?: 0)})" else body
+fun ChatMessage.preview(): String = when {
+    isVoice -> "🎤 Voice message (${formatDuration(durationMs ?: 0)})"
+    isImage -> if (body.isNotBlank()) "📷 $body" else "📷 Photo"
+    isFile -> "📄 ${fileName ?: "File"}"
+    else -> body
+}
+
+/** "2.3 MB", "640 KB" */
+fun formatFileSize(bytes: Long): String = when {
+    bytes >= 1_000_000 -> "%.1f MB".format(bytes / 1_000_000.0)
+    bytes >= 1_000 -> "${bytes / 1_000} KB"
+    else -> "$bytes B"
+}
 
 fun formatDuration(ms: Long): String = "%d:%02d".format(ms / 60_000, ms / 1000 % 60)
 
@@ -72,14 +98,20 @@ interface ChatDao {
     @Query("UPDATE messages SET mediaId = :mediaId WHERE id = :id")
     suspend fun setMediaId(id: String, mediaId: String)
 
+    @Query("UPDATE messages SET localPath = :path WHERE id = :id")
+    suspend fun setLocalPath(id: String, path: String)
+
+    @Query("UPDATE messages SET unavailable = 1 WHERE id = :id")
+    suspend fun setUnavailable(id: String)
+
     @Query("SELECT * FROM messages WHERE status = 'SENDING' ORDER BY sentAt")
     suspend fun pending(): List<ChatMessage>
 }
 
 @Database(
     entities = [Contact::class, ChatMessage::class],
-    version = 2,
-    autoMigrations = [AutoMigration(from = 1, to = 2)],
+    version = 3,
+    autoMigrations = [AutoMigration(from = 1, to = 2), AutoMigration(from = 2, to = 3)],
 )
 abstract class ChatDatabase : RoomDatabase() {
     abstract fun dao(): ChatDao

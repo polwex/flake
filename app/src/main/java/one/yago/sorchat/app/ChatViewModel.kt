@@ -2,6 +2,7 @@ package one.yago.sorchat.app
 
 import android.app.Activity
 import android.app.Application
+import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -21,6 +22,9 @@ import kotlinx.coroutines.launch
 import org.webrtc.EglBase
 import org.webrtc.VideoTrack
 
+/** Something shared into sorchat from another app, waiting for the user to pick a chat. */
+data class PendingShare(val uris: List<Uri>, val mimeType: String?, val text: String?)
+
 data class UiState(
     val me: Identity? = null,
     val contacts: List<Contact> = emptyList(),
@@ -35,6 +39,7 @@ data class UiState(
     /** [SystemClock.elapsedRealtime] when the current voice recording started, if one is running. */
     val recordingSince: Long? = null,
     val hasPasskey: Boolean = false,
+    val sharing: PendingShare? = null,
 )
 
 /** State owned by the ViewModel itself; everything else comes from [ChatRepository]. */
@@ -43,7 +48,7 @@ private data class LocalState(
     val busy: Boolean = false,
     val error: String? = null,
     val recordingSince: Long? = null,
-    val hasPasskey: Boolean = false,
+    val sharing: PendingShare? = null,
 )
 
 private data class Session(val me: Identity?, val connected: Boolean, val notice: String?, val hasPasskey: Boolean)
@@ -55,6 +60,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val player = VoicePlayer(viewModelScope)
     val playback: StateFlow<Playback?> = player.state
     val call: StateFlow<Call?> = repo.calls.call
+    val transfers: StateFlow<Map<String, Float>> = repo.transfers
     val localVideo: StateFlow<VideoTrack?> = repo.calls.localVideo
     val remoteVideo: StateFlow<VideoTrack?> = repo.calls.remoteVideo
     val eglContext: EglBase.Context get() = repo.calls.eglBase.eglBaseContext
@@ -79,6 +85,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             error = local.error ?: session.notice,
             recordingSince = local.recordingSince,
             hasPasskey = session.hasPasskey,
+            sharing = local.sharing,
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState(me = repo.identity.value))
 
@@ -162,6 +169,44 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (peer == null || recording == null) return
         val (file, durationMs) = recording
         viewModelScope.launch { repo.sendVoice(peer, file, durationMs) }
+    }
+
+    fun sendPhoto(uri: Uri) = sendAttachment("Couldn't send the photo") { repo.sendPhoto(it, uri) }
+
+    fun sendFile(uri: Uri) = sendAttachment("Couldn't send the file") { repo.sendFile(it, uri) }
+
+    fun requestDownload(message: ChatMessage) = repo.requestDownload(message.id)
+
+    /** Content shared from another app: the contact list asks where to send it. */
+    fun share(share: PendingShare) = local.update { it.copy(openChat = null, sharing = share) }
+
+    fun cancelShare() = local.update { it.copy(sharing = null) }
+
+    fun shareTo(contactId: String) {
+        val share = local.value.sharing ?: return
+        local.update { it.copy(sharing = null, openChat = contactId) }
+        viewModelScope.launch {
+            try {
+                share.text?.takeIf { it.isNotBlank() }?.let { repo.send(contactId, it) }
+                for (uri in share.uris) {
+                    if (share.mimeType?.startsWith("image/") == true) repo.sendPhoto(contactId, uri) else repo.sendFile(contactId, uri)
+                }
+            } catch (e: Exception) {
+                local.update { it.copy(error = "Couldn't send: ${e.message}") }
+            }
+        }
+    }
+
+    /** Sending runs in the background; unlike [runBusy] it doesn't block the rest of the UI. */
+    private fun sendAttachment(failure: String, send: suspend (peer: String) -> Unit) {
+        val peer = local.value.openChat ?: return
+        viewModelScope.launch {
+            try {
+                send(peer)
+            } catch (e: Exception) {
+                local.update { it.copy(error = "$failure: ${e.message}") }
+            }
+        }
     }
 
     fun startCall(video: Boolean) {

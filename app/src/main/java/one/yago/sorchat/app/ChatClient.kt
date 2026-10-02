@@ -5,18 +5,23 @@ import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.ClientRequestException
+import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
+import io.ktor.client.request.delete
 import io.ktor.client.request.post
+import io.ktor.client.request.prepareGet
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
-import io.ktor.client.statement.readRawBytes
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
-import io.ktor.http.content.ByteArrayContent
+import io.ktor.http.content.OutgoingContent
+import io.ktor.http.contentLength
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.websocket.CloseReason
@@ -24,6 +29,9 @@ import io.ktor.websocket.DefaultWebSocketSession
 import io.ktor.websocket.Frame
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.readAvailable
+import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -47,6 +55,9 @@ import one.yago.sorchat.protocol.UploadResponse
 import one.yago.sorchat.protocol.UserInfo
 import java.io.File
 import kotlin.time.Duration.Companion.seconds
+
+/** The server refused an upload, with a message for the user (file too big, storage full). */
+class UploadRejectedException(message: String) : Exception(message)
 
 /** The server no longer accepts our token (e.g. its database was reset). */
 class UnauthorizedException : Exception("Server rejected our credentials")
@@ -115,29 +126,81 @@ class ChatClient(private val baseUrl: String) {
     suspend fun iceServers(token: String): List<IceServer> =
         http.get("$baseUrl/ice-servers") { bearerAuth(token) }.body<IceServersResponse>().servers
 
-    /** Uploads a file for use as an attachment. Returns its media id. */
-    suspend fun upload(token: String, file: File, mimeType: String): String {
-        val bytes = withContext(Dispatchers.IO) { file.readBytes() }
-        return http.post("$baseUrl/media") {
-            bearerAuth(token)
-            setBody(ByteArrayContent(bytes, ContentType.parse(mimeType)))
-        }.body<UploadResponse>().mediaId
+    /**
+     * Uploads a file for use as an attachment, streaming it from disk. Returns its media id.
+     * Throws [UploadRejectedException] if the server won't take it (too big, storage full).
+     */
+    suspend fun upload(token: String, file: File, mimeType: String, onProgress: (Float) -> Unit = {}): String {
+        val length = file.length()
+        val body = object : OutgoingContent.WriteChannelContent() {
+            override val contentType = ContentType.parse(mimeType)
+            override val contentLength = length
+
+            override suspend fun writeTo(channel: ByteWriteChannel) {
+                val buffer = ByteArray(64 * 1024)
+                var sent = 0L
+                withContext(Dispatchers.IO) { file.inputStream() }.use { input ->
+                    while (true) {
+                        val n = withContext(Dispatchers.IO) { input.read(buffer) }
+                        if (n < 0) break
+                        channel.writeFully(buffer, 0, n)
+                        sent += n
+                        onProgress(sent.toFloat() / length.coerceAtLeast(1))
+                    }
+                }
+            }
+        }
+        return try {
+            http.post("$baseUrl/media") {
+                bearerAuth(token)
+                setBody(body)
+            }.body<UploadResponse>().mediaId
+        } catch (e: ResponseException) {
+            when (e.response.status) {
+                HttpStatusCode.PayloadTooLarge, HttpStatusCode.InsufficientStorage -> throw UploadRejectedException(e.response.bodyAsText())
+                else -> throw e
+            }
+        }
     }
 
-    /** Downloads an attachment to [dest]. Returns false if the server no longer has it. */
-    suspend fun download(token: String, mediaId: String, dest: File): Boolean {
-        val bytes = try {
-            http.get("$baseUrl/media/$mediaId") { bearerAuth(token) }.readRawBytes()
+    /**
+     * Downloads an attachment to [dest], streaming it to disk. Returns false if the server no
+     * longer has it.
+     */
+    suspend fun download(token: String, mediaId: String, dest: File, onProgress: (Float) -> Unit = {}): Boolean {
+        // Written under a temporary name so a partial download is never mistaken for the file.
+        val partial = File(dest.path + ".part")
+        try {
+            http.prepareGet("$baseUrl/media/$mediaId") { bearerAuth(token) }.execute { response ->
+                val total = response.contentLength() ?: -1L
+                val channel = response.bodyAsChannel()
+                val buffer = ByteArray(64 * 1024)
+                var received = 0L
+                withContext(Dispatchers.IO) { partial.outputStream() }.use { out ->
+                    while (true) {
+                        val n = channel.readAvailable(buffer, 0, buffer.size)
+                        if (n < 0) break
+                        withContext(Dispatchers.IO) { out.write(buffer, 0, n) }
+                        received += n
+                        if (total > 0) onProgress(received.toFloat() / total)
+                    }
+                }
+            }
         } catch (e: ClientRequestException) {
+            partial.delete()
             if (e.response.status == HttpStatusCode.NotFound) return false else throw e
         }
-        withContext(Dispatchers.IO) {
-            // Written under a temporary name so a partial download is never mistaken for the file.
-            val partial = File(dest.path + ".part")
-            partial.writeBytes(bytes)
-            check(partial.renameTo(dest)) { "Couldn't move download to $dest" }
-        }
+        check(partial.renameTo(dest)) { "Couldn't move download to $dest" }
         return true
+    }
+
+    /** Tells the server we have the file, so it can delete its copy. */
+    suspend fun confirmDownload(token: String, mediaId: String) {
+        try {
+            http.delete("$baseUrl/media/$mediaId") { bearerAuth(token) }
+        } catch (e: ClientRequestException) {
+            if (e.response.status != HttpStatusCode.NotFound) throw e
+        }
     }
 
     /** Closes the current connection gracefully, after anything already queued has been sent. */

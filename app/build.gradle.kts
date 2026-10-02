@@ -69,6 +69,8 @@ dependencies {
     implementation(libs.stream.webrtc)
     implementation(libs.androidx.core.telecom)
     implementation(libs.androidx.credentials)
+    implementation(libs.androidx.work.runtime)
+    implementation(libs.coil.compose)
     implementation(libs.androidx.credentials.play.services)
 
     implementation(platform(libs.firebase.bom))

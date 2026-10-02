@@ -50,6 +50,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Done
@@ -96,6 +97,8 @@ import one.yago.sorchat.app.Contact
 import one.yago.sorchat.app.MessageStatus
 import one.yago.sorchat.app.Playback
 import one.yago.sorchat.app.formatDuration
+import one.yago.sorchat.app.isFile
+import one.yago.sorchat.app.isImage
 import one.yago.sorchat.app.isVoice
 import one.yago.sorchat.app.ui.theme.LocalGradients
 import one.yago.sorchat.app.ui.theme.Sunset
@@ -139,12 +142,15 @@ fun ChatScreen(
     onBack: () -> Unit,
     onVisible: (String?) -> Unit,
     voice: VoiceControls,
+    attachments: AttachmentControls,
 ) {
     LifecycleResumeEffect(contact.id) {
         onVisible(contact.id)
         onPauseOrDispose { onVisible(null) }
     }
     var draft by rememberSaveable(contact.id) { mutableStateOf("") }
+    var attaching by rememberSaveable { mutableStateOf(false) }
+    var viewing by rememberSaveable { mutableStateOf<String?>(null) }
     // Newest first, because the list is reversed (it starts at the bottom and stays pinned there).
     val items = remember(messages) {
         buildList<ChatItem> {
@@ -173,7 +179,10 @@ fun ChatScreen(
                         item.message,
                         voice.playback?.takeIf { it.messageId == item.message.id },
                         voice.onTogglePlayback,
-                        Modifier.animateItem(placementSpec = spring(Spring.DampingRatioLowBouncy, Spring.StiffnessMediumLow)),
+                        progress = attachments.transfers[item.message.id],
+                        onOpenPhoto = { viewing = item.message.localPath },
+                        onDownload = { attachments.onDownload(item.message) },
+                        modifier = Modifier.animateItem(placementSpec = spring(Spring.DampingRatioLowBouncy, Spring.StiffnessMediumLow)),
                     )
                 }
             }
@@ -208,12 +217,25 @@ fun ChatScreen(
                             draft = ""
                         },
                         onRecord = voice.onStartRecording,
+                        onAttach = { attaching = true },
                     )
                 }
             }
         }
     }
+
+    if (attaching) AttachSheet(onDismiss = { attaching = false }, onPhoto = attachments.onSendPhoto, onFile = attachments.onSendFile)
+    viewing?.let { ImageViewer(it, onClose = { viewing = null }) }
 }
+
+/** Attachment state and actions for [ChatScreen]. */
+class AttachmentControls(
+    /** Upload/download progress by message id. */
+    val transfers: Map<String, Float>,
+    val onSendPhoto: (android.net.Uri) -> Unit,
+    val onSendFile: (android.net.Uri) -> Unit,
+    val onDownload: (ChatMessage) -> Unit,
+)
 
 @Composable
 private fun ChatTopBar(contact: Contact, connected: Boolean, onBack: () -> Unit, onCall: (video: Boolean) -> Unit) {
@@ -260,9 +282,17 @@ private fun DayChip(day: LocalDate, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun InputBar(draft: String, onDraftChange: (String) -> Unit, onSend: () -> Unit, onRecord: () -> Unit) {
+private fun InputBar(draft: String, onDraftChange: (String) -> Unit, onSend: () -> Unit, onRecord: () -> Unit, onAttach: () -> Unit) {
     val record = withMicPermission(onRecord)
     Row(verticalAlignment = Alignment.Bottom) {
+        RoundIconButton(
+            Icons.Rounded.Add,
+            "Attach",
+            onAttach,
+            background = solid(MaterialTheme.colorScheme.surfaceContainerHigh),
+            contentColor = MaterialTheme.colorScheme.primary,
+        )
+        Spacer(Modifier.width(8.dp))
         TextField(
             value = draft,
             onValueChange = onDraftChange,
@@ -349,7 +379,15 @@ private fun LiveLevels(modifier: Modifier) {
 }
 
 @Composable
-private fun MessageBubble(message: ChatMessage, playback: Playback?, onTogglePlayback: (ChatMessage) -> Unit, modifier: Modifier = Modifier) {
+private fun MessageBubble(
+    message: ChatMessage,
+    playback: Playback?,
+    onTogglePlayback: (ChatMessage) -> Unit,
+    progress: Float?,
+    onOpenPhoto: () -> Unit,
+    onDownload: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val mine = message.fromMe
     // Messages that just arrived pop in; older ones (when opening a chat) just appear.
     val pop = remember { Animatable(if (System.currentTimeMillis() - message.sentAt < 3_000) 0.6f else 1f) }
@@ -359,6 +397,27 @@ private fun MessageBubble(message: ChatMessage, playback: Playback?, onTogglePla
         val shape = if (mine) RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp) else RoundedCornerShape(22.dp, 22.dp, 22.dp, 6.dp)
         val background = if (mine) LocalGradients.current.sunset else solid(MaterialTheme.colorScheme.surfaceContainerHigh)
         val contentColor = if (mine) Color.White else MaterialTheme.colorScheme.onSurface
+        if (message.isImage) {
+            // Photos fill their bubble, with the time on a small pill over the corner.
+            Box(
+                Modifier
+                    .graphicsLayer {
+                        scaleX = pop.value
+                        scaleY = pop.value
+                        transformOrigin = TransformOrigin(if (mine) 1f else 0f, 1f)
+                    }
+                    .clip(shape),
+            ) {
+                PhotoContent(message, progress, onOpen = onOpenPhoto, onDownload = onDownload)
+                Surface(color = Color.Black.copy(alpha = 0.45f), shape = CircleShape, modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp)) {
+                    Row(Modifier.padding(horizontal = 8.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(formatMessageTime(message.sentAt), style = MaterialTheme.typography.labelSmall, color = Color.White)
+                        if (mine) StatusIcon(message.status, Color.White)
+                    }
+                }
+            }
+            return@Box
+        }
         Column(
             Modifier
                 .widthIn(max = 300.dp)
@@ -372,29 +431,43 @@ private fun MessageBubble(message: ChatMessage, playback: Playback?, onTogglePla
                 .padding(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 6.dp),
         ) {
             if (message.isVoice) {
-                VoiceNote(message, playback, onTogglePlayback, mine, contentColor)
+                VoiceNote(message, playback, onTogglePlayback, mine, contentColor, progress, onDownload)
+            } else if (message.isFile) {
+                FileContent(message, mine, contentColor, progress, onDownload)
             } else {
                 Text(message.body, color = contentColor, style = MaterialTheme.typography.bodyLarge)
             }
             Row(Modifier.align(Alignment.End).padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(formatMessageTime(message.sentAt), style = MaterialTheme.typography.labelSmall, color = contentColor.copy(alpha = 0.7f))
-                if (mine) {
-                    val (icon, description) = when (message.status) {
-                        MessageStatus.SENDING -> Icons.Rounded.Schedule to "Sending"
-                        MessageStatus.FAILED -> Icons.Rounded.ErrorOutline to "Failed"
-                        else -> Icons.Rounded.Done to "Sent"
-                    }
-                    Icon(icon, contentDescription = description, tint = contentColor.copy(alpha = 0.8f), modifier = Modifier.padding(start = 4.dp).size(14.dp))
-                }
+                if (mine) StatusIcon(message.status, contentColor.copy(alpha = 0.8f))
             }
         }
     }
 }
 
 @Composable
-private fun VoiceNote(message: ChatMessage, playback: Playback?, onToggle: (ChatMessage) -> Unit, mine: Boolean, contentColor: Color) {
+private fun StatusIcon(status: MessageStatus, tint: Color) {
+    val (icon, description) = when (status) {
+        MessageStatus.SENDING -> Icons.Rounded.Schedule to "Sending"
+        MessageStatus.FAILED -> Icons.Rounded.ErrorOutline to "Failed"
+        else -> Icons.Rounded.Done to "Sent"
+    }
+    Icon(icon, contentDescription = description, tint = tint, modifier = Modifier.padding(start = 4.dp).size(14.dp))
+}
+
+@Composable
+private fun VoiceNote(
+    message: ChatMessage,
+    playback: Playback?,
+    onToggle: (ChatMessage) -> Unit,
+    mine: Boolean,
+    contentColor: Color,
+    progress: Float?,
+    onDownload: () -> Unit,
+) {
     if (message.localPath == null) {
-        Text("Voice message unavailable", color = contentColor.copy(alpha = 0.7f))
+        if (message.unavailable) Text("Voice message no longer available", color = contentColor.copy(alpha = 0.7f))
+        else TransferBadge(progress, onDownload, tint = contentColor)
         return
     }
     val duration = message.durationMs ?: 0

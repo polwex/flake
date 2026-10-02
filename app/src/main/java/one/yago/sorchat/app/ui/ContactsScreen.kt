@@ -96,6 +96,8 @@ fun ContactsScreen(
     onOpenChat: (String) -> Unit,
     onDismissError: () -> Unit,
     onCreatePasskey: () -> Unit,
+    onShareTo: (String) -> Unit,
+    onCancelShare: () -> Unit,
 ) {
     var adding by rememberSaveable { mutableStateOf(false) }
     // Checked on every resume: the user may have just flipped the switch in system settings.
@@ -127,6 +129,30 @@ fun ContactsScreen(
             contentPadding = PaddingValues(bottom = 120.dp),
         ) {
             item(key = "header") { Header(me, state.connected) }
+
+            state.sharing?.let { share ->
+                item(key = "sharing") {
+                    val what = when {
+                        share.uris.size > 1 -> "${share.uris.size} items"
+                        share.uris.size == 1 && share.mimeType?.startsWith("image/") == true -> "a photo"
+                        share.uris.size == 1 -> "a file"
+                        else -> "a message"
+                    }
+                    Surface(
+                        shape = MaterialTheme.shapes.large,
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 16.dp),
+                    ) {
+                        Row(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Send to…", style = MaterialTheme.typography.titleMedium)
+                                Text("Pick a chat to send $what to.", style = MaterialTheme.typography.bodyMedium)
+                            }
+                            TextButton(onClick = onCancelShare) { Text("Cancel") }
+                        }
+                    }
+                }
+            }
 
             item(key = "notifications") {
                 AnimatedVisibility(!notificationsOn, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
@@ -180,7 +206,12 @@ fun ContactsScreen(
                 }
             }
             items(contacts, key = Contact::id) { contact ->
-                ContactRow(contact, state.lastMessages[contact.id], onClick = { onOpenChat(contact.id) }, modifier = Modifier.animateItem())
+                ContactRow(
+                    contact,
+                    state.lastMessages[contact.id],
+                    onClick = { if (state.sharing != null) onShareTo(contact.id) else onOpenChat(contact.id) },
+                    modifier = Modifier.animateItem(),
+                )
             }
         }
     }

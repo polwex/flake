@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the FileProvider may hand out: attachments (to open them in other apps) and camera captures. -->
+<paths>
+    <files-path name="media" path="media/" />
+    <files-path name="voice" path="voice/" />
+    <cache-path name="camera" path="camera/" />
+</paths>

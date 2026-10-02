@@ -2,6 +2,8 @@ package one.yago.sorchat.app
 
 import android.app.Activity
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Uri
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.CoroutineScope
@@ -11,6 +13,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -39,6 +42,12 @@ class ChatRepository private constructor(private val context: Context) {
     private val notifications = Notifications(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val voiceDir = File(context.filesDir, "voice").apply { mkdirs() }
+    /** Photos and files, sent and received. */
+    private val mediaDir = File(context.filesDir, "media").apply { mkdirs() }
+
+    private val _transfers = MutableStateFlow<Map<String, Float>>(emptyMap())
+    /** Upload/download progress (0..1) of attachments in flight, by message id. */
+    val transfers: StateFlow<Map<String, Float>> = _transfers.asStateFlow()
 
     /** Outgoing messages whose attachment is being uploaded, so a resend doesn't upload twice. */
     private val uploading: MutableSet<String> = ConcurrentHashMap.newKeySet()
@@ -121,6 +130,7 @@ class ChatRepository private constructor(private val context: Context) {
         withContext(Dispatchers.IO) {
             db.clearAllTables()
             voiceDir.listFiles()?.forEach(File::delete)
+            mediaDir.listFiles()?.forEach(File::delete)
         }
         val me = Identity(login.userId, login.name, login.token)
         prefs.identity = me
@@ -156,19 +166,70 @@ class ChatRepository private constructor(private val context: Context) {
     fun newRecordingFile(): File = File(context.cacheDir, "recording-${UUID.randomUUID()}.ogg")
 
     suspend fun sendVoice(peer: String, recording: File, durationMs: Long) {
-        val id = UUID.randomUUID().toString()
-        val file = File(voiceDir, "$id.ogg")
+        val file = File(voiceDir, "${UUID.randomUUID()}.ogg")
         withContext(Dispatchers.IO) {
             recording.copyTo(file)
             recording.delete()
         }
+        sendPrepared(peer, PreparedMedia(file, VOICE_MIME_TYPE, null), durationMs = durationMs)
+    }
+
+    /** Sends a photo from the gallery or camera, shrunk and compressed first. */
+    suspend fun sendPhoto(peer: String, uri: Uri) = sendPrepared(peer, preparePhoto(context.contentResolver, uri, mediaDir))
+
+    /** Sends any file, as is. */
+    suspend fun sendFile(peer: String, uri: Uri) = sendPrepared(peer, prepareFile(context.contentResolver, uri, mediaDir))
+
+    private suspend fun sendPrepared(peer: String, media: PreparedMedia, durationMs: Long? = null) {
         val message = ChatMessage(
-            id, peer, fromMe = true, body = "", System.currentTimeMillis(), MessageStatus.SENDING,
-            localPath = file.path, mimeType = VOICE_MIME_TYPE, durationMs = durationMs,
+            UUID.randomUUID().toString(), peer, fromMe = true, body = "", System.currentTimeMillis(), MessageStatus.SENDING,
+            localPath = media.file.path, mimeType = media.mimeType, durationMs = durationMs,
+            fileName = media.name, fileSize = media.file.length(), width = media.width, height = media.height,
         )
         dao.insertMessage(message)
         sounds.messageSent()
         deliver(message)
+    }
+
+    /** Fetches a received attachment the user tapped (it wasn't downloaded automatically). */
+    fun requestDownload(messageId: String) = DownloadWorker.enqueue(context, messageId)
+
+    /** Called by [DownloadWorker]. Throws on errors worth retrying. */
+    suspend fun downloadAttachment(messageId: String) {
+        val message = dao.message(messageId) ?: return
+        if (message.localPath != null || message.unavailable) return
+        val me = identity.value ?: return
+        val mediaId = message.mediaId ?: return
+        val target = downloadTarget(mediaDir, message)
+        try {
+            if (client.download(me.token, mediaId, target) { setProgress(messageId, it) }) {
+                dao.setLocalPath(messageId, target.path)
+                // Not fatal: the server forgets the file after a while anyway.
+                runCatching { client.confirmDownload(me.token, mediaId) }
+            } else {
+                dao.setUnavailable(messageId)
+            }
+        } finally {
+            setProgress(messageId, null)
+        }
+    }
+
+    /** Photos, voice notes and small files download right away; big files on mobile data wait for a tap. */
+    private fun maybeAutoDownload(message: ChatMessage) {
+        val small = (message.fileSize ?: 0) <= AUTO_DOWNLOAD_BYTES
+        val metered = context.getSystemService(ConnectivityManager::class.java).isActiveNetworkMetered
+        if (message.isVoice || message.isImage || small || !metered) DownloadWorker.enqueue(context, message.id)
+    }
+
+    /** Throttled to whole percents, so the UI isn't flooded. */
+    private fun setProgress(messageId: String, progress: Float?) {
+        _transfers.update { current ->
+            when {
+                progress == null -> current - messageId
+                ((current[messageId] ?: -1f) * 100).toInt() == (progress * 100).toInt() -> current
+                else -> current + (messageId to progress)
+            }
+        }
     }
 
     /** Called from [PushService]: connect just long enough to fetch what's waiting. */
@@ -225,16 +286,24 @@ class ChatRepository private constructor(private val context: Context) {
         if (path != null && mediaId == null) {
             if (!uploading.add(message.id)) return
             try {
-                mediaId = client.upload(me.token, File(path), message.mimeType!!)
+                mediaId = client.upload(me.token, File(path), message.mimeType!!) { setProgress(message.id, it) }
                 dao.setMediaId(message.id, mediaId)
+            } catch (e: UploadRejectedException) {
+                // Too big or no room on the server: retrying won't help.
+                dao.setStatus(message.id, MessageStatus.FAILED)
+                notice.value = e.message
+                return
             } catch (e: Exception) {
                 Log.w(TAG, "Upload of ${message.id} failed", e)
                 return
             } finally {
                 uploading.remove(message.id)
+                setProgress(message.id, null)
             }
         }
-        val attachment = mediaId?.let { Attachment(it, message.mimeType!!, File(path!!).length(), message.durationMs) }
+        val attachment = mediaId?.let {
+            Attachment(it, message.mimeType!!, File(path!!).length(), message.durationMs, message.fileName, message.width, message.height)
+        }
         client.send(ClientFrame.Send(message.id, message.peer, message.body, attachment))
     }
 
@@ -251,8 +320,9 @@ class ChatRepository private constructor(private val context: Context) {
                 dao.insertContact(sender)
                 val isNew = dao.message(frame.id) == null
                 if (isNew) {
-                    // An exception here (e.g. the download failing) skips the ack, so the server redelivers it.
-                    dao.insertMessage(receivedMessage(frame))
+                    val message = receivedMessage(frame)
+                    dao.insertMessage(message)
+                    if (message.mediaId != null) maybeAutoDownload(message)
                 }
                 // Only ack once it's on disk: the server deletes its copy on ack.
                 // Duplicates are acked too; it means the server's earlier copy wasn't deleted yet.
@@ -275,19 +345,13 @@ class ChatRepository private constructor(private val context: Context) {
         }
     }
 
-    /** Builds the local copy of an incoming message, downloading its attachment first. */
-    private suspend fun receivedMessage(frame: ServerFrame.Message): ChatMessage {
-        val attachment = frame.attachment
-        var localPath: String? = null
-        if (attachment != null) {
-            val me = checkNotNull(identity.value)
-            // Named locally rather than after the sender-chosen message id, which could contain "../".
-            val file = File(voiceDir, "${UUID.randomUUID()}.ogg")
-            if (client.download(me.token, attachment.mediaId, file)) localPath = file.path
-        }
+    /** The local copy of an incoming message. Its attachment, if any, is downloaded separately. */
+    private fun receivedMessage(frame: ServerFrame.Message): ChatMessage {
+        val a = frame.attachment
         return ChatMessage(
             frame.id, frame.from, fromMe = false, frame.body, frame.sentAt, MessageStatus.RECEIVED,
-            localPath = localPath, mediaId = attachment?.mediaId, mimeType = attachment?.mimeType, durationMs = attachment?.durationMs,
+            mediaId = a?.mediaId, mimeType = a?.mimeType, durationMs = a?.durationMs,
+            fileName = a?.name, fileSize = a?.size, width = a?.width, height = a?.height,
         )
     }
 
@@ -313,6 +377,7 @@ class ChatRepository private constructor(private val context: Context) {
         withContext(Dispatchers.IO) {
             db.clearAllTables()
             voiceDir.listFiles()?.forEach(File::delete)
+            mediaDir.listFiles()?.forEach(File::delete)
         }
         _identity.value = null
         notice.value = "The server no longer knows this account. Please register again."
@@ -321,6 +386,7 @@ class ChatRepository private constructor(private val context: Context) {
     companion object {
         private const val TAG = "ChatRepository"
         private const val VOICE_MIME_TYPE = "audio/ogg"
+        private const val AUTO_DOWNLOAD_BYTES = 5L * 1024 * 1024
 
         @Volatile
         private var instance: ChatRepository? = null

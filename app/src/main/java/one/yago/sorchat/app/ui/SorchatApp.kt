@@ -55,6 +55,7 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
     val call by vm.call.collectAsStateWithLifecycle()
     val localVideo by vm.localVideo.collectAsStateWithLifecycle()
     val remoteVideo by vm.remoteVideo.collectAsStateWithLifecycle()
+    val transfers by vm.transfers.collectAsStateWithLifecycle()
     if (state.me != null) RequestNotificationPermission()
 
     // The call screen keeps showing the last call while it animates away.
@@ -114,6 +115,12 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
                             onFinishRecording = vm::finishRecording,
                             onTogglePlayback = vm::togglePlayback,
                         ),
+                        attachments = AttachmentControls(
+                            transfers = transfers,
+                            onSendPhoto = vm::sendPhoto,
+                            onSendFile = vm::sendFile,
+                            onDownload = vm::requestDownload,
+                        ),
                     )
                 }
                 Screen.Contacts -> state.me?.let { me ->
@@ -124,6 +131,8 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
                         onOpenChat = vm::openChat,
                         onDismissError = vm::dismissError,
                         onCreatePasskey = { vm.createPasskey(activity) },
+                        onShareTo = vm::shareTo,
+                        onCancelShare = vm::cancelShare,
                     )
                 }
             }
