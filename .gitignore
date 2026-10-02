@@ -23,3 +23,6 @@ captures/
 server/data/
 *.db
 bulk
+
+# Server build copied next to deploy/sorchat.nix for deployment
+deploy/server.tar

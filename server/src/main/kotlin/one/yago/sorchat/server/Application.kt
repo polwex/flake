@@ -45,6 +45,7 @@ import one.yago.sorchat.protocol.UserInfo
 private val MESSAGE_TTL = 30.days
 
 fun main() {
+    val host = System.getenv("HOST") ?: "0.0.0.0"
     val port = System.getenv("PORT")?.toInt() ?: 8080
     val dbPath = System.getenv("SORCHAT_DB") ?: "data/sorchat.db"
     val mediaDir = File(System.getenv("SORCHAT_MEDIA_DIR") ?: "data/media")
@@ -54,12 +55,14 @@ fun main() {
         ?: System.getenv("SORCHAT_FCM_CREDENTIALS")?.takeIf { it.isNotBlank() }?.let { File(it).readText() }
     val notifier = fcmCredentials?.let { FcmNotifier(store, it) } ?: LogNotifier()
     // coturn, e.g. SORCHAT_TURN_URLS="stun:turn.example.com:3478,turn:turn.example.com:3478,turns:turn.example.com:5349"
-    // with SORCHAT_TURN_SECRET matching its static-auth-secret. Without it, only a public STUN server is offered.
+    // with SORCHAT_TURN_SECRET (or a file holding it, SORCHAT_TURN_SECRET_FILE) matching its static-auth-secret.
+    // Without it, only a public STUN server is offered.
     val ice = IceConfig(
         urls = System.getenv("SORCHAT_TURN_URLS")?.split(",")?.map(String::trim)?.filter(String::isNotEmpty).orEmpty(),
-        secret = System.getenv("SORCHAT_TURN_SECRET")?.takeIf { it.isNotBlank() },
+        secret = (System.getenv("SORCHAT_TURN_SECRET") ?: System.getenv("SORCHAT_TURN_SECRET_FILE")?.let { File(it).readText() })
+            ?.trim()?.takeIf { it.isNotEmpty() },
     )
-    embeddedServer(Netty, port = port, host = "0.0.0.0") {
+    embeddedServer(Netty, port = port, host = host) {
         log.info("Push notifications via {}", notifier::class.simpleName)
         log.info("ICE servers: {}", ice.describe())
         sorchat(store, notifier, mediaDir, ice)
