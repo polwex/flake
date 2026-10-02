@@ -50,20 +50,19 @@ in {
     '';
   };
 
-  # Let's Encrypt certificate via lego's built-in HTTP-01 server on port 80.
-  # If nginx/caddy already owns port 80, use `webroot` instead of `listenHTTP`.
+  # Let's Encrypt certificate, with the HTTP-01 challenge served by the existing nginx.
+  # The vhost only answers the challenge; nginx doesn't use the certificate itself.
+  services.nginx.virtualHosts.${domain}.enableACME = true;
   security.acme = {
     acceptTerms = true;
-    defaults.email = "you@example.com"; # change me
-    certs.${domain} = {
-      listenHTTP = ":80";
-      group = "turnserver"; # coturn runs as this user and must read the key
-      reloadServices = ["coturn.service"];
-    };
+    defaults.email = "you@example.com"; # change me (may already be set elsewhere)
+    certs.${domain}.reloadServices = ["coturn.service"];
   };
+  # The certificate belongs to the nginx group; coturn (user `turnserver`) needs to read it too.
+  users.users.turnserver.extraGroups = ["nginx"];
 
   networking.firewall = {
-    allowedTCPPorts = [80 3478 5349];
+    allowedTCPPorts = [3478 5349]; # plus 80 for ACME, which the nginx setup presumably opens already
     allowedUDPPorts = [3478 5349];
     allowedUDPPortRanges = [
       {
