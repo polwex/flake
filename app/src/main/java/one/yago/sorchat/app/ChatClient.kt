@@ -35,6 +35,9 @@ import kotlinx.serialization.SerializationException
 import one.yago.sorchat.protocol.ClientFrame
 import one.yago.sorchat.protocol.IceServer
 import one.yago.sorchat.protocol.IceServersResponse
+import one.yago.sorchat.protocol.LoginResponse
+import one.yago.sorchat.protocol.PasskeyOptions
+import one.yago.sorchat.protocol.PasskeyResponse
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
@@ -89,6 +92,25 @@ class ChatClient(private val baseUrl: String) {
             setBody(PushTokenRequest(pushToken))
         }
     }
+
+    suspend fun passkeyRegisterStart(token: String): PasskeyOptions =
+        http.post("$baseUrl/passkey/register/start") { bearerAuth(token) }.body()
+
+    suspend fun passkeyRegisterFinish(token: String, response: PasskeyResponse) {
+        http.post("$baseUrl/passkey/register/finish") {
+            bearerAuth(token)
+            contentType(ContentType.Application.Json)
+            setBody(response)
+        }
+    }
+
+    suspend fun passkeyLoginStart(): PasskeyOptions = http.post("$baseUrl/passkey/login/start").body()
+
+    suspend fun passkeyLoginFinish(response: PasskeyResponse): LoginResponse =
+        http.post("$baseUrl/passkey/login/finish") {
+            contentType(ContentType.Application.Json)
+            setBody(response)
+        }.body()
 
     suspend fun iceServers(token: String): List<IceServer> =
         http.get("$baseUrl/ice-servers") { bearerAuth(token) }.body<IceServersResponse>().servers

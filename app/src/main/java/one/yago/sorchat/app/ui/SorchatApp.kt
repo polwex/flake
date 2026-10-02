@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -23,6 +24,8 @@ import one.yago.sorchat.app.Contact
 @Composable
 fun SorchatApp(vm: ChatViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
+    // Passkey prompts need an Activity to show over.
+    val activity = checkNotNull(LocalActivity.current)
     val playback by vm.playback.collectAsStateWithLifecycle()
     val call by vm.call.collectAsStateWithLifecycle()
     val localVideo by vm.localVideo.collectAsStateWithLifecycle()
@@ -44,7 +47,11 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
                 onMute = vm::setMuted,
                 onSpeaker = vm::setSpeaker,
             )
-            me == null -> RegisterScreen(state, onRegister = vm::register)
+            me == null -> RegisterScreen(
+                state,
+                onRegister = { vm.register(it, activity) },
+                onSignIn = { vm.signInWithPasskey(activity) },
+            )
             chat != null -> {
                 BackHandler { vm.openChat(null) }
                 ChatScreen(
@@ -73,6 +80,7 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
                 onAddContact = vm::addContact,
                 onOpenChat = vm::openChat,
                 onDismissError = vm::dismissError,
+                onCreatePasskey = { vm.createPasskey(activity) },
             )
         }
     }

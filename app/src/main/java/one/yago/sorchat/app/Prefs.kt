@@ -18,6 +18,11 @@ class Prefs(context: Context) {
             if (value == null) remove(KEY_IDENTITY) else putString(KEY_IDENTITY, Json.encodeToString(value))
         }
 
+    /** Whether this account has a passkey, so it can be recovered on another device. */
+    var hasPasskey: Boolean
+        get() = prefs.getBoolean(KEY_HAS_PASSKEY, false)
+        set(value) = prefs.edit { putBoolean(KEY_HAS_PASSKEY, value) }
+
     /** This install's current FCM token, as last reported by FCM. */
     var pushToken: String?
         get() = prefs.getString(KEY_CURRENT_PUSH_TOKEN, null)
@@ -30,6 +35,7 @@ class Prefs(context: Context) {
 
     private companion object {
         const val KEY_IDENTITY = "identity"
+        const val KEY_HAS_PASSKEY = "has_passkey"
         const val KEY_CURRENT_PUSH_TOKEN = "push_token"
         const val KEY_PUSH_TOKEN = "registered_push_token"
     }

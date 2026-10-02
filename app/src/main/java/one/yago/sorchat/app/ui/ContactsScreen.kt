@@ -46,6 +46,7 @@ fun ContactsScreen(
     onAddContact: (String) -> Unit,
     onOpenChat: (String) -> Unit,
     onDismissError: () -> Unit,
+    onCreatePasskey: () -> Unit,
 ) {
     var newContact by rememberSaveable { mutableStateOf("") }
     fun add() {
@@ -68,6 +69,16 @@ fun ContactsScreen(
                     Text("Share your ID so people can add you:")
                     SelectionContainer {
                         Text(me.id, style = MaterialTheme.typography.headlineSmall, fontFamily = FontFamily.Monospace)
+                    }
+                }
+            }
+
+            if (!state.hasPasskey) {
+                Card(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Protect your account", style = MaterialTheme.typography.titleMedium)
+                        Text("Without a passkey, this account is lost if you reinstall the app or change phones.")
+                        TextButton(onClick = onCreatePasskey, enabled = !state.busy) { Text("Create passkey") }
                     }
                 }
             }

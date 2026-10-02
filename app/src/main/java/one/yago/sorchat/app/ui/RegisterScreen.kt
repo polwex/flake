@@ -9,6 +9,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -24,7 +25,7 @@ import androidx.compose.ui.unit.dp
 import one.yago.sorchat.app.UiState
 
 @Composable
-fun RegisterScreen(state: UiState, onRegister: (String) -> Unit) {
+fun RegisterScreen(state: UiState, onRegister: (String) -> Unit, onSignIn: () -> Unit) {
     var name by rememberSaveable { mutableStateOf("") }
     Scaffold { padding ->
         Column(
@@ -47,6 +48,10 @@ fun RegisterScreen(state: UiState, onRegister: (String) -> Unit) {
                 enabled = name.isNotBlank() && !state.busy,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text(if (state.busy) "Registering…" else "Get started") }
+            Text("Already have an account?", modifier = Modifier.padding(top = 16.dp))
+            OutlinedButton(onClick = onSignIn, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
+                Text("Sign in with passkey")
+            }
             state.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         }
     }

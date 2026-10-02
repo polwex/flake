@@ -1,5 +1,6 @@
 package one.yago.sorchat.app
 
+import android.app.Activity
 import android.content.Context
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessaging
@@ -33,6 +34,7 @@ class ChatRepository private constructor(private val context: Context) {
     private val db = ChatDatabase.get(context)
     val dao = db.dao()
     private val client = ChatClient(BuildConfig.SERVER_URL)
+    private val passkeys = Passkeys(client)
     private val notifications = Notifications(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val voiceDir = File(context.filesDir, "voice").apply { mkdirs() }
@@ -50,6 +52,9 @@ class ChatRepository private constructor(private val context: Context) {
         sendSignal = { to, callId, signal -> client.send(ClientFrame.Call(to, callId, signal)) },
         iceServers = { client.iceServers(checkNotNull(identity.value).token) },
     )
+
+    private val _hasPasskey = MutableStateFlow(prefs.hasPasskey)
+    val hasPasskey: StateFlow<Boolean> = _hasPasskey.asStateFlow()
 
     /** Something the user should be told about that happened outside the UI's control. */
     val notice = MutableStateFlow<String?>(null)
@@ -94,9 +99,39 @@ class ChatRepository private constructor(private val context: Context) {
         val me = Identity(response.userId, name, response.token)
         prefs.identity = me
         prefs.registeredPushToken = null
+        setHasPasskey(false)
         notice.value = null
         _identity.value = me
         updateConnection()
+    }
+
+    /** Adds a passkey to the current account. Throws [PasskeyCancelledException] if dismissed. */
+    suspend fun createPasskey(activity: Activity) {
+        val me = checkNotNull(identity.value)
+        passkeys.create(activity, me.token)
+        setHasPasskey(true)
+    }
+
+    /** Signs in to an existing account with a passkey, e.g. after reinstalling or on a new phone. */
+    suspend fun signInWithPasskey(activity: Activity) {
+        val login = passkeys.signIn(activity)
+        // Whatever was stored locally belonged to whichever account was here before.
+        withContext(Dispatchers.IO) {
+            db.clearAllTables()
+            voiceDir.listFiles()?.forEach(File::delete)
+        }
+        val me = Identity(login.userId, login.name, login.token)
+        prefs.identity = me
+        prefs.registeredPushToken = null
+        setHasPasskey(true)
+        notice.value = null
+        _identity.value = me
+        updateConnection()
+    }
+
+    private fun setHasPasskey(value: Boolean) {
+        prefs.hasPasskey = value
+        _hasPasskey.value = value
     }
 
     /** Returns false if there's no user with this id. */

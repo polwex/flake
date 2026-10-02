@@ -1,10 +1,12 @@
 package one.yago.sorchat.app
 
+import android.app.Activity
 import android.app.Application
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +34,7 @@ data class UiState(
     val error: String? = null,
     /** [SystemClock.elapsedRealtime] when the current voice recording started, if one is running. */
     val recordingSince: Long? = null,
+    val hasPasskey: Boolean = false,
 )
 
 /** State owned by the ViewModel itself; everything else comes from [ChatRepository]. */
@@ -40,9 +43,10 @@ private data class LocalState(
     val busy: Boolean = false,
     val error: String? = null,
     val recordingSince: Long? = null,
+    val hasPasskey: Boolean = false,
 )
 
-private data class Session(val me: Identity?, val connected: Boolean, val notice: String?)
+private data class Session(val me: Identity?, val connected: Boolean, val notice: String?, val hasPasskey: Boolean)
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val repo = ChatRepository.get(app)
@@ -59,7 +63,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val conversation = local.map { it.openChat }.distinctUntilChanged()
         .flatMapLatest { peer -> if (peer == null) flowOf(emptyList()) else repo.dao.conversation(peer) }
 
-    private val session = combine(repo.identity, repo.connected, repo.notice, ::Session)
+    private val session = combine(repo.identity, repo.connected, repo.notice, repo.hasPasskey, ::Session)
 
     val state: StateFlow<UiState> = combine(
         local, session, repo.dao.contacts(), repo.dao.lastMessages(), conversation,
@@ -74,13 +78,36 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             busy = local.busy,
             error = local.error ?: session.notice,
             recordingSince = local.recordingSince,
+            hasPasskey = session.hasPasskey,
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState(me = repo.identity.value))
 
-    fun register(name: String) {
+    /** Creates an account, then offers to protect it with a passkey (skippable). */
+    fun register(name: String, activity: Activity) {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return
-        runBusy("Couldn't register") { repo.register(trimmed) }
+        viewModelScope.launch {
+            runBusy("Couldn't register") { repo.register(trimmed) }.join()
+            // A failing passkey is reported as such, not as a failed registration.
+            if (repo.identity.value != null) createPasskey(activity)
+        }
+    }
+
+    fun createPasskey(activity: Activity) = runBusy("Couldn't create a passkey") { createPasskeyQuietly(activity) }
+
+    fun signInWithPasskey(activity: Activity) = runBusy("Couldn't sign in") {
+        try {
+            repo.signInWithPasskey(activity)
+        } catch (_: PasskeyCancelledException) {
+        }
+    }
+
+    private suspend fun createPasskeyQuietly(activity: Activity) {
+        try {
+            repo.createPasskey(activity)
+        } catch (_: PasskeyCancelledException) {
+            // Fine: the account works without one, and the contacts screen offers it again.
+        }
     }
 
     fun addContact(rawId: String) {
@@ -165,7 +192,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         player.stop()
     }
 
-    private fun runBusy(failure: String, block: suspend () -> Unit) {
+    private fun runBusy(failure: String, block: suspend () -> Unit): Job =
         viewModelScope.launch {
             local.update { it.copy(busy = true, error = null) }
             try {
@@ -176,5 +203,4 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 local.update { it.copy(busy = false) }
             }
         }
-    }
 }
