@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A smiling speech bubble. Also the in-app logo. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- soft shadow -->
+    <group android:translateY="2"><path android:fillColor="#26000000" android:pathData="M46,31 H62 A16,16 0 0 1 78,47 V54 A16,16 0 0 1 62,70 H49 L37,80 L38.5,68.2 A16,16 0 0 1 30,54 V47 A16,16 0 0 1 46,31 Z" /></group>
+    <path android:fillColor="#FFFFFFFF" android:pathData="M46,31 H62 A16,16 0 0 1 78,47 V54 A16,16 0 0 1 62,70 H49 L37,80 L38.5,68.2 A16,16 0 0 1 30,54 V47 A16,16 0 0 1 46,31 Z" />
+    <path android:fillColor="#FFFF5F6D" android:pathData="M44,47 a3.5,3.5 0 1 0 7,0 a3.5,3.5 0 1 0 -7,0 Z M57,47 a3.5,3.5 0 1 0 7,0 a3.5,3.5 0 1 0 -7,0 Z" />
+    <path
+        android:pathData="M45,55.5 Q54,64 63,55.5"
+        android:strokeColor="#FFFF5F6D"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round" />
+</vector>

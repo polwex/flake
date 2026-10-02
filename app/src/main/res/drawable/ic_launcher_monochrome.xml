@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon version: the bubble with the face cut out. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#FF000000" android:fillType="evenOdd" android:pathData="M46,31 H62 A16,16 0 0 1 78,47 V54 A16,16 0 0 1 62,70 H49 L37,80 L38.5,68.2 A16,16 0 0 1 30,54 V47 A16,16 0 0 1 46,31 Z M44,47 a3.5,3.5 0 1 0 7,0 a3.5,3.5 0 1 0 -7,0 Z M57,47 a3.5,3.5 0 1 0 7,0 a3.5,3.5 0 1 0 -7,0 Z" />
+</vector>

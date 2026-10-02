@@ -35,6 +35,7 @@ class ChatRepository private constructor(private val context: Context) {
     val dao = db.dao()
     private val client = ChatClient(BuildConfig.SERVER_URL)
     private val passkeys = Passkeys(client)
+    private val sounds = Sounds(context)
     private val notifications = Notifications(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val voiceDir = File(context.filesDir, "voice").apply { mkdirs() }
@@ -49,6 +50,7 @@ class ChatRepository private constructor(private val context: Context) {
     val calls = CallManager(
         context,
         scope,
+        sounds,
         sendSignal = { to, callId, signal -> client.send(ClientFrame.Call(to, callId, signal)) },
         iceServers = { client.iceServers(checkNotNull(identity.value).token) },
     )
@@ -146,6 +148,7 @@ class ChatRepository private constructor(private val context: Context) {
         val message = ChatMessage(UUID.randomUUID().toString(), peer, fromMe = true, body, System.currentTimeMillis(), MessageStatus.SENDING)
         // Stored first, so it survives the app being killed and is resent by resendPending().
         dao.insertMessage(message)
+        sounds.messageSent()
         deliver(message)
     }
 
@@ -164,6 +167,7 @@ class ChatRepository private constructor(private val context: Context) {
             localPath = file.path, mimeType = VOICE_MIME_TYPE, durationMs = durationMs,
         )
         dao.insertMessage(message)
+        sounds.messageSent()
         deliver(message)
     }
 
@@ -253,7 +257,10 @@ class ChatRepository private constructor(private val context: Context) {
                 // Only ack once it's on disk: the server deletes its copy on ack.
                 // Duplicates are acked too; it means the server's earlier copy wasn't deleted yet.
                 client.send(ClientFrame.Ack(frame.id))
-                if (isNew && !(foreground && visibleChat == frame.from)) {
+                if (isNew && foreground && visibleChat == frame.from) {
+                    // Looking at this chat: no notification, just a soft chime.
+                    sounds.messageReceived()
+                } else if (isNew) {
                     dao.message(frame.id)?.let { notifications.showMessage(it, sender) }
                 }
             }

@@ -88,6 +88,7 @@ data class Call(
 class CallManager(
     private val context: Context,
     parentScope: CoroutineScope,
+    private val sounds: Sounds,
     private val sendSignal: (to: String, callId: String, signal: CallSignal) -> Boolean,
     private val iceServers: suspend () -> List<IceServer>,
 ) {
@@ -166,6 +167,7 @@ class CallManager(
             val sdp = pc.awaitCreate(offer = true)
             pc.awaitSetLocal(sdp)
             send(CallSignal.Invite(sdp.description, video = call.video))
+            sounds.startRingback()
             timeout = scope.launch {
                 delay(RING_TIMEOUT)
                 if (_call.value?.let { it.id == call.id && it.phase == CallPhase.OUTGOING } == true) {
@@ -294,6 +296,7 @@ class CallManager(
                     is CallSignal.Accept -> {
                         val pc = peerConnection ?: return@launch
                         timeout?.cancel()
+                        sounds.stopRingback()
                         _call.value = current.copy(phase = CallPhase.CONNECTING)
                         pc.awaitSetRemote(SessionDescription(SessionDescription.Type.ANSWER, signal.sdp))
                         onRemoteDescriptionSet(pc)
@@ -468,6 +471,9 @@ class CallManager(
         val call = _call.value ?: return
         timeout?.cancel()
         stopRinging()
+        sounds.stopRingback()
+        // A call that rang out unanswered on our side is a missed call, not a hang-up.
+        if (call.phase != CallPhase.INCOMING) sounds.callEnded()
         stopMedia()
         resetConnectionState()
         if (telecom == null) {
@@ -543,6 +549,7 @@ class CallManager(
                             _call.value = call.copy(phase = CallPhase.ACTIVE, connectedAt = System.currentTimeMillis())
                             control?.let { c -> c.launch { c.setActive() } }
                             logSelectedPair()
+                            sounds.callConnected()
                             // Video calls are held at arm's length.
                             if (call.video) setSpeaker(true)
                         }
