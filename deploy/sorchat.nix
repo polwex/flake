@@ -49,6 +49,32 @@ in {
       description = "Firebase service-account JSON for push notifications. Without it, pushes are only logged.";
     };
 
+    backup = {
+      enable = mkEnableOption "daily backups of the sorchat database and media";
+
+      directory = mkOption {
+        type = types.path;
+        default = "/var/backup/sorchat";
+        description = ''
+          Where backups go, one timestamped directory each. Copy them off the machine too
+          (e.g. with services.restic or services.borgbackup) to survive losing the VPS.
+        '';
+      };
+
+      schedule = mkOption {
+        type = types.str;
+        default = "daily";
+        example = "*-*-* 04:00:00";
+        description = "When to back up, as a systemd OnCalendar expression.";
+      };
+
+      keepDays = mkOption {
+        type = types.ints.positive;
+        default = 14;
+        description = "Backups older than this many days are deleted.";
+      };
+    };
+
     turn = {
       domain = mkOption {
         type = types.nullOr types.str;
@@ -67,6 +93,43 @@ in {
   };
 
   config = mkIf cfg.enable {
+    # Restore: stop sorchat, copy a backup's sorchat.db and media/ to /var/lib/private/sorchat/,
+    # start sorchat (systemd fixes the ownership).
+    systemd.services.sorchat-backup = mkIf cfg.backup.enable {
+      description = "Back up the sorchat database and media";
+      path = [pkgs.sqlite pkgs.coreutils pkgs.findutils];
+      script = ''
+        set -euo pipefail
+        dest=${lib.escapeShellArg cfg.backup.directory}/$(date +%Y-%m-%d_%H%M%S)
+        mkdir -p "$dest"
+        # SQLite's online backup gives a consistent copy while the server keeps writing.
+        sqlite3 /var/lib/private/sorchat/sorchat.db ".backup '$dest/sorchat.db'"
+        if [ -d /var/lib/private/sorchat/media ]; then
+          cp -a --reflink=auto /var/lib/private/sorchat/media "$dest/"
+        fi
+        find ${lib.escapeShellArg cfg.backup.directory} -mindepth 1 -maxdepth 1 -type d \
+          -mtime +${toString cfg.backup.keepDays} -exec rm -rf {} +
+        echo "Backed up to $dest ($(du -sh "$dest" | cut -f1))"
+      '';
+      serviceConfig = {
+        Type = "oneshot";
+        # Backups hold everyone's queued messages: root only.
+        UMask = "0077";
+        Nice = 10;
+        IOSchedulingClass = "idle";
+      };
+    };
+
+    systemd.timers.sorchat-backup = mkIf cfg.backup.enable {
+      wantedBy = ["timers.target"];
+      timerConfig = {
+        OnCalendar = cfg.backup.schedule;
+        # Catch up after the machine was off at the scheduled time.
+        Persistent = true;
+        RandomizedDelaySec = "15m";
+      };
+    };
+
     systemd.services.sorchat = {
       description = "sorchat chat server";
       wantedBy = ["multi-user.target"];
