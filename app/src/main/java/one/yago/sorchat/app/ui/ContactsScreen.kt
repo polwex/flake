@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import one.yago.sorchat.app.Contact
 import one.yago.sorchat.app.Identity
 import one.yago.sorchat.app.UiState
+import one.yago.sorchat.app.preview
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -107,7 +108,7 @@ fun ContactsScreen(
                     val last = state.lastMessages[contact.id]
                     ListItem(
                         headlineContent = { Text(contact.name) },
-                        supportingContent = { Text(last?.body ?: contact.id, maxLines = 1) },
+                        supportingContent = { Text(last?.preview() ?: contact.id, maxLines = 1) },
                         modifier = Modifier.clickable { onOpenChat(contact.id) },
                     )
                     HorizontalDivider()

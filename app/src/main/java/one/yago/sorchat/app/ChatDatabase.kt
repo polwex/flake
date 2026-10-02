@@ -1,6 +1,7 @@
 package one.yago.sorchat.app
 
 import android.content.Context
+import androidx.room.AutoMigration
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Entity
@@ -27,7 +28,21 @@ data class ChatMessage(
     val body: String,
     val sentAt: Long,
     val status: MessageStatus,
+    /** Voice notes: the audio file on this device. Null for text, or if the download was no longer available. */
+    val localPath: String? = null,
+    /** The server's id for the attachment, once uploaded (outgoing) or as received (incoming). */
+    val mediaId: String? = null,
+    val mimeType: String? = null,
+    val durationMs: Long? = null,
 )
+
+val ChatMessage.isVoice: Boolean get() = mimeType?.startsWith("audio/") == true
+
+/** One-line summary for the contact list and notifications. */
+fun ChatMessage.preview(): String =
+    if (isVoice) "🎤 Voice message (${formatDuration(durationMs ?: 0)})" else body
+
+fun formatDuration(ms: Long): String = "%d:%02d".format(ms / 60_000, ms / 1000 % 60)
 
 @Dao
 interface ChatDao {
@@ -51,11 +66,21 @@ interface ChatDao {
     @Query("UPDATE messages SET status = :status WHERE id = :id")
     suspend fun setStatus(id: String, status: MessageStatus)
 
+    @Query("SELECT * FROM messages WHERE id = :id")
+    suspend fun message(id: String): ChatMessage?
+
+    @Query("UPDATE messages SET mediaId = :mediaId WHERE id = :id")
+    suspend fun setMediaId(id: String, mediaId: String)
+
     @Query("SELECT * FROM messages WHERE status = 'SENDING' ORDER BY sentAt")
     suspend fun pending(): List<ChatMessage>
 }
 
-@Database(entities = [Contact::class, ChatMessage::class], version = 1)
+@Database(
+    entities = [Contact::class, ChatMessage::class],
+    version = 2,
+    autoMigrations = [AutoMigration(from = 1, to = 2)],
+)
 abstract class ChatDatabase : RoomDatabase() {
     abstract fun dao(): ChatDao
 

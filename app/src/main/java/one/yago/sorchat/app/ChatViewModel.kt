@@ -1,6 +1,7 @@
 package one.yago.sorchat.app
 
 import android.app.Application
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -27,6 +28,8 @@ data class UiState(
     val connected: Boolean = false,
     val busy: Boolean = false,
     val error: String? = null,
+    /** [SystemClock.elapsedRealtime] when the current voice recording started, if one is running. */
+    val recordingSince: Long? = null,
 )
 
 /** State owned by the ViewModel itself; everything else comes from [ChatRepository]. */
@@ -34,6 +37,7 @@ private data class LocalState(
     val openChat: String? = null,
     val busy: Boolean = false,
     val error: String? = null,
+    val recordingSince: Long? = null,
 )
 
 private data class Session(val me: Identity?, val connected: Boolean, val notice: String?)
@@ -41,6 +45,9 @@ private data class Session(val me: Identity?, val connected: Boolean, val notice
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val repo = ChatRepository.get(app)
     private val local = MutableStateFlow(LocalState())
+    private val recorder = VoiceRecorder(app)
+    private val player = VoicePlayer(viewModelScope)
+    val playback: StateFlow<Playback?> = player.state
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private val conversation = local.map { it.openChat }.distinctUntilChanged()
@@ -60,6 +67,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             connected = session.connected,
             busy = local.busy,
             error = local.error ?: session.notice,
+            recordingSince = local.recordingSince,
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState(me = repo.identity.value))
 
@@ -78,7 +86,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun openChat(contactId: String?) = local.update { it.copy(openChat = contactId) }
+    fun openChat(contactId: String?) {
+        cancelRecording()
+        player.stop()
+        local.update { it.copy(openChat = contactId) }
+    }
 
     /** Called while a chat is on screen, so its messages don't also raise notifications. */
     fun setVisibleChat(contactId: String?) {
@@ -94,6 +106,43 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val peer = local.value.openChat ?: return
         val body = text.trim().ifEmpty { return }
         viewModelScope.launch { repo.send(peer, body) }
+    }
+
+    fun startRecording() {
+        try {
+            recorder.start(repo.newRecordingFile())
+            local.update { it.copy(recordingSince = SystemClock.elapsedRealtime()) }
+        } catch (e: Exception) {
+            local.update { it.copy(error = "Couldn't start recording: ${e.message}") }
+        }
+    }
+
+    fun cancelRecording() {
+        recorder.cancel()
+        local.update { it.copy(recordingSince = null) }
+    }
+
+    fun finishRecording() {
+        val peer = local.value.openChat
+        val recording = recorder.stop()
+        local.update { it.copy(recordingSince = null) }
+        if (peer == null || recording == null) return
+        val (file, durationMs) = recording
+        viewModelScope.launch { repo.sendVoice(peer, file, durationMs) }
+    }
+
+    fun togglePlayback(message: ChatMessage) {
+        try {
+            player.toggle(message)
+        } catch (e: Exception) {
+            player.stop()
+            local.update { it.copy(error = "Couldn't play voice message: ${e.message}") }
+        }
+    }
+
+    override fun onCleared() {
+        recorder.cancel()
+        player.stop()
     }
 
     private fun runBusy(failure: String, block: suspend () -> Unit) {

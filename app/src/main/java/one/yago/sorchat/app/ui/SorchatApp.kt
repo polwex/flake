@@ -23,6 +23,7 @@ import one.yago.sorchat.app.Contact
 @Composable
 fun SorchatApp(vm: ChatViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val playback by vm.playback.collectAsStateWithLifecycle()
     if (state.me != null) RequestNotificationPermission()
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         val me = state.me
@@ -35,9 +36,19 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
                     contact = state.contacts.firstOrNull { it.id == chat } ?: Contact(chat, chat),
                     messages = state.conversation,
                     connected = state.connected,
+                    error = state.error,
+                    onDismissError = vm::dismissError,
                     onSend = vm::send,
                     onBack = { vm.openChat(null) },
                     onVisible = vm::setVisibleChat,
+                    voice = VoiceControls(
+                        recordingSince = state.recordingSince,
+                        playback = playback,
+                        onStartRecording = vm::startRecording,
+                        onCancelRecording = vm::cancelRecording,
+                        onFinishRecording = vm::finishRecording,
+                        onTogglePlayback = vm::togglePlayback,
+                    ),
                 )
             }
             else -> ContactsScreen(

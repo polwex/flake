@@ -13,8 +13,10 @@ import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.readRawBytes
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.content.ByteArrayContent
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.websocket.CloseReason
@@ -23,10 +25,12 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import one.yago.sorchat.protocol.ClientFrame
 import one.yago.sorchat.protocol.ProtocolJson
@@ -34,7 +38,9 @@ import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
 import one.yago.sorchat.protocol.RegisterResponse
 import one.yago.sorchat.protocol.ServerFrame
+import one.yago.sorchat.protocol.UploadResponse
 import one.yago.sorchat.protocol.UserInfo
+import java.io.File
 import kotlin.time.Duration.Companion.seconds
 
 /** The server no longer accepts our token (e.g. its database was reset). */
@@ -80,6 +86,31 @@ class ChatClient(private val baseUrl: String) {
             contentType(ContentType.Application.Json)
             setBody(PushTokenRequest(pushToken))
         }
+    }
+
+    /** Uploads a file for use as an attachment. Returns its media id. */
+    suspend fun upload(token: String, file: File, mimeType: String): String {
+        val bytes = withContext(Dispatchers.IO) { file.readBytes() }
+        return http.post("$baseUrl/media") {
+            bearerAuth(token)
+            setBody(ByteArrayContent(bytes, ContentType.parse(mimeType)))
+        }.body<UploadResponse>().mediaId
+    }
+
+    /** Downloads an attachment to [dest]. Returns false if the server no longer has it. */
+    suspend fun download(token: String, mediaId: String, dest: File): Boolean {
+        val bytes = try {
+            http.get("$baseUrl/media/$mediaId") { bearerAuth(token) }.readRawBytes()
+        } catch (e: ClientRequestException) {
+            if (e.response.status == HttpStatusCode.NotFound) return false else throw e
+        }
+        withContext(Dispatchers.IO) {
+            // Written under a temporary name so a partial download is never mistaken for the file.
+            val partial = File(dest.path + ".part")
+            partial.writeBytes(bytes)
+            check(partial.renameTo(dest)) { "Couldn't move download to $dest" }
+        }
+        return true
     }
 
     /** Closes the current connection gracefully, after anything already queued has been sent. */

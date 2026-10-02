@@ -32,7 +32,7 @@ class Notifications(private val context: Context) {
         val existing = manager.activeNotifications.firstOrNull { it.id == id }?.notification
         val style = existing?.let(NotificationCompat.MessagingStyle::extractMessagingStyleFromNotification)
             ?: NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
-        style.addMessage(message.body, message.sentAt, Person.Builder().setKey(sender.id).setName(sender.name).build())
+        style.addMessage(message.preview(), message.sentAt, Person.Builder().setKey(sender.id).setName(sender.name).build())
 
         val open = Intent(context, MainActivity::class.java)
             .putExtra(MainActivity.EXTRA_CHAT, sender.id)

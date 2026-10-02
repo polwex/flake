@@ -16,22 +16,29 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import one.yago.sorchat.protocol.Attachment
 import one.yago.sorchat.protocol.ClientFrame
 import one.yago.sorchat.protocol.ServerFrame
+import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.time.Duration.Companion.seconds
 
 /**
  * App-wide owner of the account, local database and server connection. Shared by the UI
  * (through [ChatViewModel]) and [PushService], which may run without any UI.
  */
-class ChatRepository private constructor(context: Context) {
+class ChatRepository private constructor(private val context: Context) {
     private val prefs = Prefs(context)
     private val db = ChatDatabase.get(context)
     val dao = db.dao()
     private val client = ChatClient(BuildConfig.SERVER_URL)
     private val notifications = Notifications(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val voiceDir = File(context.filesDir, "voice").apply { mkdirs() }
+
+    /** Outgoing messages whose attachment is being uploaded, so a resend doesn't upload twice. */
+    private val uploading: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     private val _identity = MutableStateFlow(prefs.identity)
     val identity: StateFlow<Identity?> = _identity.asStateFlow()
@@ -91,7 +98,25 @@ class ChatRepository private constructor(context: Context) {
         val message = ChatMessage(UUID.randomUUID().toString(), peer, fromMe = true, body, System.currentTimeMillis(), MessageStatus.SENDING)
         // Stored first, so it survives the app being killed and is resent by resendPending().
         dao.insertMessage(message)
-        client.send(ClientFrame.Send(message.id, peer, body))
+        deliver(message)
+    }
+
+    /** Where a new recording should be written before it's sent. */
+    fun newRecordingFile(): File = File(context.cacheDir, "recording-${UUID.randomUUID()}.ogg")
+
+    suspend fun sendVoice(peer: String, recording: File, durationMs: Long) {
+        val id = UUID.randomUUID().toString()
+        val file = File(voiceDir, "$id.ogg")
+        withContext(Dispatchers.IO) {
+            recording.copyTo(file)
+            recording.delete()
+        }
+        val message = ChatMessage(
+            id, peer, fromMe = true, body = "", System.currentTimeMillis(), MessageStatus.SENDING,
+            localPath = file.path, mimeType = VOICE_MIME_TYPE, durationMs = durationMs,
+        )
+        dao.insertMessage(message)
+        deliver(message)
     }
 
     /** Called from [PushService]: connect just long enough to fetch what's waiting. */
@@ -137,9 +162,34 @@ class ChatRepository private constructor(context: Context) {
         }
     }
 
+    /**
+     * Sends a stored outgoing message, uploading its attachment first if that hasn't happened yet.
+     * If anything fails it stays SENDING and is retried by [resendPending] on the next connection.
+     */
+    private suspend fun deliver(message: ChatMessage) {
+        val me = identity.value ?: return
+        var mediaId = message.mediaId
+        val path = message.localPath
+        if (path != null && mediaId == null) {
+            if (!uploading.add(message.id)) return
+            try {
+                mediaId = client.upload(me.token, File(path), message.mimeType!!)
+                dao.setMediaId(message.id, mediaId)
+            } catch (e: Exception) {
+                Log.w(TAG, "Upload of ${message.id} failed", e)
+                return
+            } finally {
+                uploading.remove(message.id)
+            }
+        }
+        val attachment = mediaId?.let { Attachment(it, message.mimeType!!, File(path!!).length(), message.durationMs) }
+        client.send(ClientFrame.Send(message.id, message.peer, message.body, attachment))
+    }
+
     /** The server dedupes by message id, so resending something it already has is harmless. */
-    private suspend fun resendPending() {
-        for (m in dao.pending()) client.send(ClientFrame.Send(m.id, m.peer, m.body))
+    private fun resendPending() {
+        // In the background: uploads can take a while and mustn't hold up incoming frames.
+        scope.launch { for (m in dao.pending()) deliver(m) }
     }
 
     private suspend fun handle(frame: ServerFrame) {
@@ -147,12 +197,17 @@ class ChatRepository private constructor(context: Context) {
             is ServerFrame.Message -> {
                 val sender = Contact(frame.from, frame.fromName)
                 dao.insertContact(sender)
-                val message = ChatMessage(frame.id, frame.from, fromMe = false, frame.body, frame.sentAt, MessageStatus.RECEIVED)
-                val isNew = dao.insertMessage(message) != -1L
+                val isNew = dao.message(frame.id) == null
+                if (isNew) {
+                    // An exception here (e.g. the download failing) skips the ack, so the server redelivers it.
+                    dao.insertMessage(receivedMessage(frame))
+                }
                 // Only ack once it's on disk: the server deletes its copy on ack.
                 // Duplicates are acked too; it means the server's earlier copy wasn't deleted yet.
                 client.send(ClientFrame.Ack(frame.id))
-                if (isNew && !(foreground && visibleChat == frame.from)) notifications.showMessage(message, sender)
+                if (isNew && !(foreground && visibleChat == frame.from)) {
+                    dao.message(frame.id)?.let { notifications.showMessage(it, sender) }
+                }
             }
             is ServerFrame.Accepted -> dao.setStatus(frame.id, MessageStatus.SENT)
             is ServerFrame.Synced -> Unit
@@ -162,6 +217,22 @@ class ChatRepository private constructor(context: Context) {
                 else notice.value = frame.reason
             }
         }
+    }
+
+    /** Builds the local copy of an incoming message, downloading its attachment first. */
+    private suspend fun receivedMessage(frame: ServerFrame.Message): ChatMessage {
+        val attachment = frame.attachment
+        var localPath: String? = null
+        if (attachment != null) {
+            val me = checkNotNull(identity.value)
+            // Named locally rather than after the sender-chosen message id, which could contain "../".
+            val file = File(voiceDir, "${UUID.randomUUID()}.ogg")
+            if (client.download(me.token, attachment.mediaId, file)) localPath = file.path
+        }
+        return ChatMessage(
+            frame.id, frame.from, fromMe = false, frame.body, frame.sentAt, MessageStatus.RECEIVED,
+            localPath = localPath, mediaId = attachment?.mediaId, mimeType = attachment?.mimeType, durationMs = attachment?.durationMs,
+        )
     }
 
     private suspend fun registerPushToken(me: Identity) {
@@ -183,13 +254,17 @@ class ChatRepository private constructor(context: Context) {
     private suspend fun resetAccount() {
         prefs.identity = null
         prefs.registeredPushToken = null
-        withContext(Dispatchers.IO) { db.clearAllTables() }
+        withContext(Dispatchers.IO) {
+            db.clearAllTables()
+            voiceDir.listFiles()?.forEach(File::delete)
+        }
         _identity.value = null
         notice.value = "The server no longer knows this account. Please register again."
     }
 
     companion object {
         private const val TAG = "ChatRepository"
+        private const val VOICE_MIME_TYPE = "audio/ogg"
 
         @Volatile
         private var instance: ChatRepository? = null

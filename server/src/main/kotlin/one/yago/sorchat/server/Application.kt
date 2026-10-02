@@ -1,5 +1,6 @@
 package one.yago.sorchat.server
 
+import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -7,11 +8,14 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.install
 import io.ktor.server.application.log
 import io.ktor.server.engine.embeddedServer
+import io.ktor.server.http.content.LocalFileContent
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.request.contentType
 import io.ktor.server.request.receive
+import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -21,18 +25,20 @@ import io.ktor.server.websocket.WebSockets
 import io.ktor.server.websocket.pingPeriod
 import io.ktor.server.websocket.timeout
 import io.ktor.server.websocket.webSocket
+import io.ktor.utils.io.jvm.javaio.toInputStream
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.close
+import java.io.File
+import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
+import one.yago.sorchat.protocol.UploadResponse
 import one.yago.sorchat.protocol.UserInfo
-import java.io.File
-import kotlin.time.Duration.Companion.days
-import kotlin.time.Duration.Companion.hours
-import kotlin.time.Duration.Companion.seconds
 
 /** Undelivered messages are dropped after this long. */
 private val MESSAGE_TTL = 30.days
@@ -40,6 +46,7 @@ private val MESSAGE_TTL = 30.days
 fun main() {
     val port = System.getenv("PORT")?.toInt() ?: 8080
     val dbPath = System.getenv("SORCHAT_DB") ?: "data/sorchat.db"
+    val mediaDir = File(System.getenv("SORCHAT_MEDIA_DIR") ?: "data/media")
     val store = Store.open(dbPath)
     // Firebase service-account key, given as JSON content or as a file path; without it, pushes are only logged.
     val fcmCredentials = System.getenv("SORCHAT_FCM_CREDENTIALS_JSON")?.takeIf { it.isNotBlank() }
@@ -47,12 +54,13 @@ fun main() {
     val notifier = fcmCredentials?.let { FcmNotifier(store, it) } ?: LogNotifier()
     embeddedServer(Netty, port = port, host = "0.0.0.0") {
         log.info("Push notifications via {}", notifier::class.simpleName)
-        sorchat(store, notifier)
+        sorchat(store, notifier, mediaDir)
     }.start(wait = true)
 }
 
-fun Application.sorchat(store: Store, notifier: Notifier) {
-    val hub = Hub(store, notifier)
+fun Application.sorchat(store: Store, notifier: Notifier, mediaDir: File) {
+    val media = MediaStore(mediaDir, store)
+    val hub = Hub(store, media, notifier)
 
     install(ContentNegotiation) { json(ProtocolJson) }
     install(WebSockets) {
@@ -65,7 +73,9 @@ fun Application.sorchat(store: Store, notifier: Notifier) {
 
     launch {
         while (true) {
-            store.deleteMessagesOlderThan(System.currentTimeMillis() - MESSAGE_TTL.inWholeMilliseconds)
+            val cutoff = System.currentTimeMillis() - MESSAGE_TTL.inWholeMilliseconds
+            store.deleteMessagesOlderThan(cutoff)
+            media.deleteOlderThan(cutoff)
             delay(1.hours)
         }
     }
@@ -94,6 +104,32 @@ fun Application.sorchat(store: Store, notifier: Notifier) {
             }
             store.setPushToken(user.id, call.receive<PushTokenRequest>().token)
             call.respond(HttpStatusCode.NoContent)
+        }
+
+        post("/media") {
+            val user = call.user()
+            if (user == null) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            }
+            val type = call.request.contentType().withoutParameters()
+            if (type.contentType != "audio") {
+                call.respond(HttpStatusCode.UnsupportedMediaType)
+                return@post
+            }
+            val id = call.receiveChannel().toInputStream().use { media.save(user.id, type.toString(), it) }
+            if (id == null) call.respond(HttpStatusCode.PayloadTooLarge)
+            else call.respond(UploadResponse(id))
+        }
+
+        get("/media/{id}") {
+            if (call.user() == null) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@get
+            }
+            val found = media.find(call.parameters["id"]!!)
+            if (found == null) call.respond(HttpStatusCode.NotFound)
+            else call.respond(LocalFileContent(media.file(found), ContentType.parse(found.mimeType)))
         }
 
         get("/users/{id}") {

@@ -18,7 +18,7 @@ private const val MAX_BODY_LENGTH = 16 * 1024
  * Routes messages between connected users. Delivery is at-least-once: every message is
  * stored first and only deleted when the recipient acks it, so clients dedupe by message id.
  */
-class Hub(private val store: Store, private val notifier: Notifier) {
+class Hub(private val store: Store, private val media: MediaStore, private val notifier: Notifier) {
     private val log = LoggerFactory.getLogger(Hub::class.java)
 
     /** One live connection per user for now (no multi-device yet). */
@@ -57,7 +57,16 @@ class Hub(private val store: Store, private val notifier: Notifier) {
                     session.sendFrame(ServerFrame.Error(frame.id, "unknown recipient"))
                     return
                 }
-                val message = ServerFrame.Message(frame.id, user.id, user.name, frame.body, System.currentTimeMillis())
+                val attachment = frame.attachment?.let { a ->
+                    val uploaded = media.find(a.mediaId)?.takeIf { it.owner == user.id }
+                    if (uploaded == null) {
+                        session.sendFrame(ServerFrame.Error(frame.id, "unknown attachment"))
+                        return
+                    }
+                    // Trust our own record of the upload over what the client claims.
+                    a.copy(mimeType = uploaded.mimeType, size = uploaded.size)
+                }
+                val message = ServerFrame.Message(frame.id, user.id, user.name, frame.body, System.currentTimeMillis(), attachment)
                 when (store.storeMessage(message, recipient.id)) {
                     StoreResult.STORED -> {
                         session.sendFrame(ServerFrame.Accepted(frame.id))
@@ -67,7 +76,7 @@ class Hub(private val store: Store, private val notifier: Notifier) {
                     StoreResult.CONFLICT -> session.sendFrame(ServerFrame.Error(frame.id, "message id already in use"))
                 }
             }
-            is ClientFrame.Ack -> store.deleteMessage(frame.id, user.id)
+            is ClientFrame.Ack -> store.deleteMessage(frame.id, user.id)?.let { media.delete(it) }
         }
     }
 

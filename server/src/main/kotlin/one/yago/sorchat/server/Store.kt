@@ -2,6 +2,8 @@ package one.yago.sorchat.server
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import one.yago.sorchat.protocol.Attachment
+import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.RegisterResponse
 import one.yago.sorchat.protocol.ServerFrame
 import java.io.File
@@ -13,6 +15,8 @@ import java.sql.Statement
 import java.util.Base64
 
 data class User(val id: String, val name: String)
+
+data class Media(val id: String, val owner: String, val mimeType: String, val size: Long)
 
 enum class StoreResult { STORED, DUPLICATE, CONFLICT }
 
@@ -84,7 +88,7 @@ class Store private constructor(private val conn: Connection) {
 
     suspend fun storeMessage(message: ServerFrame.Message, recipient: String): StoreResult = db {
         val inserted = prepareStatement(
-            "INSERT OR IGNORE INTO messages(id, sender, recipient, sender_name, body, sent_at) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT OR IGNORE INTO messages(id, sender, recipient, sender_name, body, sent_at, attachment) VALUES (?, ?, ?, ?, ?, ?, ?)"
         ).use {
             it.setString(1, message.id)
             it.setString(2, message.from)
@@ -92,6 +96,7 @@ class Store private constructor(private val conn: Connection) {
             it.setString(4, message.fromName)
             it.setString(5, message.body)
             it.setLong(6, message.sentAt)
+            it.setString(7, message.attachment?.let { a -> ProtocolJson.encodeToString(Attachment.serializer(), a) })
             it.executeUpdate() == 1
         }
         if (inserted) return@db StoreResult.STORED
@@ -106,31 +111,71 @@ class Store private constructor(private val conn: Connection) {
 
     suspend fun pendingFor(recipient: String): List<ServerFrame.Message> = db {
         prepareStatement(
-            "SELECT id, sender, sender_name, body, sent_at FROM messages WHERE recipient = ? ORDER BY sent_at"
+            "SELECT id, sender, sender_name, body, sent_at, attachment FROM messages WHERE recipient = ? ORDER BY sent_at"
         ).use {
             it.setString(1, recipient)
             it.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) {
-                        add(ServerFrame.Message(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), rs.getLong(5)))
+                        val attachment = rs.getString(6)?.let { ProtocolJson.decodeFromString(Attachment.serializer(), it) }
+                        add(ServerFrame.Message(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), rs.getLong(5), attachment))
                     }
                 }
             }
         }
     }
 
-    suspend fun deleteMessage(id: String, recipient: String) = db {
+    /** Deletes an acked message. Returns its attachment's media id, which is now unreferenced. */
+    suspend fun deleteMessage(id: String, recipient: String): String? = db {
+        val attachment = prepareStatement("SELECT attachment FROM messages WHERE id = ? AND recipient = ?").use {
+            it.setString(1, id)
+            it.setString(2, recipient)
+            it.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
+        }
         prepareStatement("DELETE FROM messages WHERE id = ? AND recipient = ?").use {
             it.setString(1, id)
             it.setString(2, recipient)
             it.executeUpdate()
         }
+        attachment?.let { ProtocolJson.decodeFromString(Attachment.serializer(), it).mediaId }
     }
 
     suspend fun deleteMessagesOlderThan(cutoff: Long) = db {
         prepareStatement("DELETE FROM messages WHERE sent_at < ?").use {
             it.setLong(1, cutoff)
             it.executeUpdate()
+        }
+    }
+
+    suspend fun addMedia(media: Media) = db {
+        prepareStatement("INSERT INTO media(id, owner, mime_type, size, created_at) VALUES (?, ?, ?, ?, ?)").use {
+            it.setString(1, media.id)
+            it.setString(2, media.owner)
+            it.setString(3, media.mimeType)
+            it.setLong(4, media.size)
+            it.setLong(5, System.currentTimeMillis())
+            it.executeUpdate()
+        }
+    }
+
+    suspend fun findMedia(id: String): Media? = db {
+        prepareStatement("SELECT id, owner, mime_type, size FROM media WHERE id = ?").use {
+            it.setString(1, id)
+            it.executeQuery().use { rs -> if (rs.next()) Media(rs.getString(1), rs.getString(2), rs.getString(3), rs.getLong(4)) else null }
+        }
+    }
+
+    suspend fun deleteMedia(id: String) = db {
+        prepareStatement("DELETE FROM media WHERE id = ?").use {
+            it.setString(1, id)
+            it.executeUpdate()
+        }
+    }
+
+    suspend fun mediaOlderThan(cutoff: Long): List<String> = db {
+        prepareStatement("SELECT id FROM media WHERE created_at < ?").use {
+            it.setLong(1, cutoff)
+            it.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1)) } }
         }
     }
 
@@ -145,12 +190,13 @@ class Store private constructor(private val conn: Connection) {
         /** Lowercase letters and digits without look-alikes (0/o, 1/l/i), so ids are easy to type. */
         private const val ID_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 
+        private fun columns(st: Statement, table: String): Set<String> =
+            st.executeQuery("PRAGMA table_info($table)").use { rs -> buildSet { while (rs.next()) add(rs.getString("name")) } }
+
         /** Additive schema changes for databases created by older versions. */
         private fun migrate(st: Statement) {
-            val userColumns = st.executeQuery("PRAGMA table_info(users)").use { rs ->
-                buildSet { while (rs.next()) add(rs.getString("name")) }
-            }
-            if ("push_token" !in userColumns) st.execute("ALTER TABLE users ADD COLUMN push_token TEXT")
+            if ("push_token" !in columns(st, "users")) st.execute("ALTER TABLE users ADD COLUMN push_token TEXT")
+            if ("attachment" !in columns(st, "messages")) st.execute("ALTER TABLE messages ADD COLUMN attachment TEXT")
         }
 
         fun open(path: String): Store {
@@ -181,6 +227,17 @@ class Store private constructor(private val conn: Connection) {
                     """
                 )
                 st.execute("CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, sent_at)")
+                st.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS media (
+                        id TEXT PRIMARY KEY,
+                        owner TEXT NOT NULL,
+                        mime_type TEXT NOT NULL,
+                        size INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL
+                    )
+                    """
+                )
                 migrate(st)
             }
             return Store(conn)

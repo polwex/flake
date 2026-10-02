@@ -1,0 +1,1 @@
+ANDROID_SERIAL=A7UHVB4611025932 ./gradlew :app:installDebug -Psorchat.serverUrl=http://localhost:8080; and adb -s A7UHVB4611025932 reverse tcp:8080 tcp:8080; and adb -s A7UHVB4611025932 shell am start -n one.yago.sorchat/one.yago.sorchat.app.MainActivity

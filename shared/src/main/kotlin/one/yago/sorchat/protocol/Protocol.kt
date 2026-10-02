@@ -22,6 +22,20 @@ data class RegisterResponse(val userId: String, val token: String)
 @Serializable
 data class UserInfo(val id: String, val name: String)
 
+/** Response to `POST /media`: the id to reference the upload by in a message's [Attachment]. */
+@Serializable
+data class UploadResponse(val mediaId: String)
+
+/** A file sent along with a message, uploaded beforehand through `POST /media`. */
+@Serializable
+data class Attachment(
+    val mediaId: String,
+    val mimeType: String,
+    val size: Long,
+    /** For audio and video. */
+    val durationMs: Long? = null,
+)
+
 /** Registers the device's FCM token so the server can wake it when messages are waiting. */
 @Serializable
 data class PushTokenRequest(val token: String)
@@ -37,7 +51,12 @@ sealed interface ClientFrame {
      */
     @Serializable
     @SerialName("send")
-    data class Send(val id: String, val to: String, val body: String) : ClientFrame
+    data class Send(
+        val id: String,
+        val to: String,
+        val body: String,
+        val attachment: Attachment? = null,
+    ) : ClientFrame
 
     /** Confirms receipt of a message; the server then deletes it from its queue. */
     @Serializable
@@ -62,6 +81,7 @@ sealed interface ServerFrame {
         val fromName: String,
         val body: String,
         val sentAt: Long,
+        val attachment: Attachment? = null,
     ) : ServerFrame
 
     /** All messages queued while the client was offline have been sent. */

@@ -11,6 +11,8 @@ import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.readRawBytes
+import io.ktor.http.content.ByteArrayContent
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
@@ -20,18 +22,22 @@ import io.ktor.server.testing.testApplication
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
 import kotlinx.coroutines.withTimeout
+import one.yago.sorchat.protocol.Attachment
 import one.yago.sorchat.protocol.ClientFrame
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
 import one.yago.sorchat.protocol.RegisterResponse
 import one.yago.sorchat.protocol.ServerFrame
+import one.yago.sorchat.protocol.UploadResponse
+import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 
 class MessagingTest {
     private fun ApplicationTestBuilder.setUp(pushed: MutableList<String>): HttpClient {
-        application { sorchat(Store.open(":memory:")) { pushed += it } }
+        application { sorchat(Store.open(":memory:"), { pushed += it }, createTempDirectory().toFile()) }
         return createClient {
             install(ContentNegotiation) { json(ProtocolJson) }
             install(WebSockets)
@@ -107,7 +113,7 @@ class MessagingTest {
     @Test
     fun `push token is stored per user`() = testApplication {
         val store = Store.open(":memory:")
-        application { sorchat(store) {} }
+        application { sorchat(store, {}, createTempDirectory().toFile()) }
         val client = createClient { install(ContentNegotiation) { json(ProtocolJson) } }
         val alice = client.register("Alice")
 
@@ -124,5 +130,57 @@ class MessagingTest {
         assertEquals("fcm-token-1", store.pushToken(alice.userId))
         store.clearPushToken(alice.userId, "fcm-token-1")
         assertEquals(null, store.pushToken(alice.userId))
+    }
+
+    @Test
+    fun `voice note is uploaded, delivered with its message and deleted after ack`() = testApplication {
+        val mediaDir = createTempDirectory().toFile()
+        application { sorchat(Store.open(":memory:"), {}, mediaDir) }
+        val client = createClient {
+            install(ContentNegotiation) { json(ProtocolJson) }
+            install(WebSockets)
+        }
+        val alice = client.register("Alice")
+        val bob = client.register("Bob")
+        val audio = ByteArray(5_000) { it.toByte() }
+
+        val upload: UploadResponse = client.post("/media") {
+            bearerAuth(alice.token)
+            setBody(ByteArrayContent(audio, ContentType.parse("audio/ogg")))
+        }.body()
+
+        client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
+            assertEquals(ServerFrame.Synced, receiveFrame())
+            // The client's claims about the file are replaced by the server's record.
+            send(ClientFrame.Send("v1", bob.userId, "", Attachment(upload.mediaId, "audio/fake", 1, durationMs = 1_200)))
+            assertEquals(ServerFrame.Accepted("v1"), receiveFrame())
+            send(ClientFrame.Send("v2", bob.userId, "", Attachment("0".repeat(32), "audio/ogg", 1)))
+            assertEquals(ServerFrame.Error("v2", "unknown attachment"), receiveFrame())
+        }
+
+        client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
+            val attachment = (receiveFrame() as ServerFrame.Message).attachment!!
+            assertEquals(Attachment(upload.mediaId, "audio/ogg", audio.size.toLong(), 1_200), attachment)
+            val download = client.get("/media/${attachment.mediaId}") { bearerAuth(bob.token) }
+            assertEquals(ContentType.parse("audio/ogg"), download.contentType())
+            assertContentEquals(audio, download.readRawBytes())
+            send(ClientFrame.Ack("v1"))
+            assertEquals(ServerFrame.Synced, receiveFrame())
+        }
+
+        assertEquals(HttpStatusCode.NotFound, client.get("/media/${upload.mediaId}") { bearerAuth(bob.token) }.status)
+        assertEquals(emptyList(), mediaDir.list()!!.toList())
+    }
+
+    @Test
+    fun `uploads must be audio`() = testApplication {
+        application { sorchat(Store.open(":memory:"), {}, createTempDirectory().toFile()) }
+        val client = createClient { install(ContentNegotiation) { json(ProtocolJson) } }
+        val alice = client.register("Alice")
+        val response = client.post("/media") {
+            bearerAuth(alice.token)
+            setBody(ByteArrayContent(ByteArray(10), ContentType.Application.Pdf))
+        }
+        assertEquals(HttpStatusCode.UnsupportedMediaType, response.status)
     }
 }
