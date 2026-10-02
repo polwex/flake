@@ -14,7 +14,7 @@
 in
   stdenv.mkDerivation (finalAttrs: {
     pname = "sorchat-server";
-    version = "0.1.0";
+    version = "0.2.0";
 
     # Only what the server build reads, so app changes don't trigger rebuilds.
     src = fs.toSource {

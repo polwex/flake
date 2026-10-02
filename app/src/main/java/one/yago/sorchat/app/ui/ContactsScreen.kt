@@ -2,6 +2,7 @@ package one.yago.sorchat.app.ui
 
 import android.content.ClipData
 import android.content.Intent
+import android.provider.Settings
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -39,6 +40,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -74,6 +76,8 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.app.NotificationManagerCompat
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import kotlinx.coroutines.launch
 import one.yago.sorchat.app.ChatMessage
 import one.yago.sorchat.app.Contact
@@ -94,6 +98,13 @@ fun ContactsScreen(
     onCreatePasskey: () -> Unit,
 ) {
     var adding by rememberSaveable { mutableStateOf(false) }
+    // Checked on every resume: the user may have just flipped the switch in system settings.
+    val context = LocalContext.current
+    var notificationsOn by remember { mutableStateOf(true) }
+    LifecycleResumeEffect(Unit) {
+        notificationsOn = NotificationManagerCompat.from(context).areNotificationsEnabled()
+        onPauseOrDispose {}
+    }
     // Most recent conversation first; contacts without messages after, by name.
     val contacts = remember(state.contacts, state.lastMessages) {
         state.contacts.sortedWith(compareByDescending<Contact> { state.lastMessages[it.id]?.sentAt ?: 0L }.thenBy { it.name.lowercase() })
@@ -117,9 +128,32 @@ fun ContactsScreen(
         ) {
             item(key = "header") { Header(me, state.connected) }
 
+            item(key = "notifications") {
+                AnimatedVisibility(!notificationsOn, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+                    NoticeCard(
+                        icon = Icons.Rounded.NotificationsOff,
+                        title = "Notifications are off",
+                        text = "You won't hear about new messages, and calls won't ring.",
+                        action = "Turn on",
+                        onAction = {
+                            context.startActivity(
+                                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName),
+                            )
+                        },
+                    )
+                }
+            }
+
             item(key = "passkey") {
                 AnimatedVisibility(!state.hasPasskey, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
-                    PasskeyCard(busy = state.busy, onCreate = onCreatePasskey)
+                    NoticeCard(
+                        icon = Icons.Rounded.Lock,
+                        title = "Protect your account",
+                        text = "Add a passkey so you can get back in after reinstalling or on a new phone.",
+                        action = "Add",
+                        enabled = !state.busy,
+                        onAction = onCreatePasskey,
+                    )
                 }
             }
 
@@ -224,7 +258,14 @@ fun StatusPill(connected: Boolean, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun PasskeyCard(busy: Boolean, onCreate: () -> Unit) {
+private fun NoticeCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    text: String,
+    action: String,
+    onAction: () -> Unit,
+    enabled: Boolean = true,
+) {
     Surface(
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.secondaryContainer,
@@ -232,17 +273,17 @@ private fun PasskeyCard(busy: Boolean, onCreate: () -> Unit) {
     ) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(44.dp).clip(CircleShape).background(LocalGradients.current.sunset), contentAlignment = Alignment.Center) {
-                Icon(Icons.Rounded.Lock, contentDescription = null, tint = Color.White)
+                Icon(icon, contentDescription = null, tint = Color.White)
             }
             Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                Text("Protect your account", style = MaterialTheme.typography.titleMedium)
+                Text(title, style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "Add a passkey so you can get back in after reinstalling or on a new phone.",
+                    text,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f),
                 )
             }
-            TextButton(onClick = onCreate, enabled = !busy) { Text("Add") }
+            TextButton(onClick = onAction, enabled = enabled) { Text(action) }
         }
     }
 }
