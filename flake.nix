@@ -33,6 +33,10 @@
           sorchat-server = pkgs.callPackage ./nix/sorchat-server.nix {
             inherit (nixpkgs-gradle.legacyPackages.${system}) gradle_9;
           };
+          # Load tester for a sorchat server; run it on the server's machine (see loadtest/).
+          sorchat-loadtest = pkgs.callPackage ./nix/sorchat-loadtest.nix {
+            inherit (nixpkgs-gradle.legacyPackages.${system}) gradle_9;
+          };
           default = sorchat-server;
         };
       }

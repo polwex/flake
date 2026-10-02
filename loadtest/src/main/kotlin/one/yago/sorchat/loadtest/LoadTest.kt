@@ -7,7 +7,7 @@ import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession
 import io.ktor.client.plugins.websocket.WebSockets
-import io.ktor.client.plugins.websocket.webSocket
+import io.ktor.client.plugins.websocket.webSocketSession
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
@@ -166,6 +166,9 @@ class LoadTest(private val o: Options) {
     private val delivered = AtomicLong()
     private val errors = AtomicLong()
     private val disconnects = AtomicLong()
+    private val connectErrors = AtomicLong()
+    @Volatile
+    private var lastConnectError: String? = null
     /** Sent text messages not delivered yet: id → nanoTime sent. */
     private val inFlight = ConcurrentHashMap<String, Long>()
     private val firstErrors = ConcurrentLinkedQueue<String>()
@@ -175,8 +178,10 @@ class LoadTest(private val o: Options) {
         val users = register()
         println("Registered ${users.size} users. Connecting over ${o.rampSeconds}s…")
         return kotlinx.coroutines.coroutineScope {
-            val connections = users.mapIndexed { i, user ->
-                launch {
+            // In the background scope, not this one: a connection stuck somewhere mustn't keep the
+            // run from ending. main() exits the process after the summary, which ends them all.
+            users.forEachIndexed { i, user ->
+                background.launch {
                     delay(o.rampSeconds * 1000L * i / users.size)
                     connect(user)
                 }
@@ -184,6 +189,7 @@ class LoadTest(private val o: Options) {
             val reporter = launch { report() }
             waitForConnections(users.size)
             println("Connected: ${connected.get()}/${users.size}. Sending for ${o.durationSeconds}s…")
+            if (connected.get() < users.size) println("  (not everyone could connect; last failure: ${lastConnectError ?: "none"})")
 
             val senders = buildList {
                 add(launch { sendTexts(users) })
@@ -193,7 +199,6 @@ class LoadTest(private val o: Options) {
             // Let the last messages arrive before counting what's missing.
             withTimeoutOrNull(10_000) { while (inFlight.isNotEmpty()) delay(100) }
             reporter.cancel()
-            connections.forEach { it.cancel() }
             summary()
         }
     }
@@ -220,7 +225,8 @@ class LoadTest(private val o: Options) {
     private suspend fun connect(user: User) {
         while (kotlinx.coroutines.currentCoroutineContext().isActive) {
             try {
-                http.webSocket(wsUrl, request = { bearerAuth(user.account.token) }) {
+                val socket = withTimeoutOrNull(15_000) { http.webSocketSession(wsUrl) { bearerAuth(user.account.token) } }
+                if (socket == null) connectFailed("timed out") else with(socket) {
                     user.session = this
                     connected.incrementAndGet()
                     val writer = launch { for (frame in user.outgoing) send(Frame.Text(ProtocolJson.encodeToString(ClientFrame.serializer(), frame))) }
@@ -242,12 +248,12 @@ class LoadTest(private val o: Options) {
                         user.session = null
                         connected.decrementAndGet()
                     }
+                    disconnects.incrementAndGet()
                 }
-                disconnects.incrementAndGet()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                error("connection: ${e.message}")
+                connectFailed(e.message ?: e::class.simpleName ?: "error")
             }
             delay(1_000)
         }
@@ -328,6 +334,11 @@ class LoadTest(private val o: Options) {
         return users[a] to users[b]
     }
 
+    private fun connectFailed(reason: String) {
+        connectErrors.incrementAndGet()
+        lastConnectError = reason
+    }
+
     private fun error(message: String?) {
         errors.incrementAndGet()
         if (firstErrors.size < 10) firstErrors += message ?: "unknown"
@@ -339,7 +350,7 @@ class LoadTest(private val o: Options) {
             delay(5_000)
             val t = (System.currentTimeMillis() - start) / 1000
             println(
-                "[${t}s] connected=${connected.get()} sent=${sent.get()} delivered=${delivered.get()} " +
+                "[${t}s] connected=${connected.get()} connect-failures=${connectErrors.get()} sent=${sent.get()} delivered=${delivered.get()} " +
                     "in-flight=${inFlight.size} errors=${errors.get()} | ${delivery.drainSummary()}" +
                     (if (o.uploadRate > 0) " | ${upload.drainSummary()} | ${download.drainSummary()}" else "")
             )
@@ -356,8 +367,9 @@ class LoadTest(private val o: Options) {
             println(upload.totalSummary())
             println(download.totalSummary())
         }
-        println("Errors: ${errors.get()}, reconnects: ${disconnects.get()}")
+        println("Errors: ${errors.get()}, reconnects: ${disconnects.get()}, failed connection attempts: ${connectErrors.get()}")
+        lastConnectError?.let { println("  last connection failure: $it") }
         firstErrors.forEach { println("  - $it") }
-        return lost == 0 && errors.get() == 0L
+        return lost == 0 && errors.get() == 0L && connectErrors.get() == 0L
     }
 }

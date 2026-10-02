@@ -23,4 +23,6 @@ dependencies {
     implementation(libs.ktor.client.cio)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.kotlinx.json)
+    // Ktor logs through SLF4J; the tester prints its own output.
+    runtimeOnly(libs.slf4j.nop)
 }
