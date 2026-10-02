@@ -39,7 +39,7 @@ import kotlin.test.assertEquals
 
 class MessagingTest {
     private fun ApplicationTestBuilder.setUp(pushed: MutableList<String>): HttpClient {
-        application { sorchat(Store.open(":memory:"), { pushed += it }, createTempDirectory().toFile()) }
+        application { sorchat(Store.open(":memory:"), { userId, _ -> pushed += userId; true }, createTempDirectory().toFile()) }
         return createClient {
             install(ContentNegotiation) { json(ProtocolJson) }
             install(WebSockets)
@@ -115,7 +115,7 @@ class MessagingTest {
     @Test
     fun `push token is stored per user`() = testApplication {
         val store = Store.open(":memory:")
-        application { sorchat(store, {}, createTempDirectory().toFile()) }
+        application { sorchat(store, { _, _ -> true }, createTempDirectory().toFile()) }
         val client = createClient { install(ContentNegotiation) { json(ProtocolJson) } }
         val alice = client.register("Alice")
 
@@ -137,7 +137,7 @@ class MessagingTest {
     @Test
     fun `voice note is uploaded, delivered with its message and deleted after ack`() = testApplication {
         val mediaDir = createTempDirectory().toFile()
-        application { sorchat(Store.open(":memory:"), {}, mediaDir) }
+        application { sorchat(Store.open(":memory:"), { _, _ -> true }, mediaDir) }
         val client = createClient {
             install(ContentNegotiation) { json(ProtocolJson) }
             install(WebSockets)
@@ -176,7 +176,7 @@ class MessagingTest {
 
     @Test
     fun `uploads must be audio`() = testApplication {
-        application { sorchat(Store.open(":memory:"), {}, createTempDirectory().toFile()) }
+        application { sorchat(Store.open(":memory:"), { _, _ -> true }, createTempDirectory().toFile()) }
         val client = createClient { install(ContentNegotiation) { json(ProtocolJson) } }
         val alice = client.register("Alice")
         val response = client.post("/media") {
@@ -187,7 +187,7 @@ class MessagingTest {
     }
 
     @Test
-    fun `call signals are relayed between connected users only`() = testApplication {
+    fun `call signals are relayed between connected users`() = testApplication {
         val client = setUp(mutableListOf())
         val alice = client.register("Alice")
         val bob = client.register("Bob")
@@ -195,18 +195,70 @@ class MessagingTest {
         client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
             val aliceWs = this
             assertEquals(ServerFrame.Synced, aliceWs.receiveFrame())
-            // Bob is offline: the invite bounces back as unavailable.
-            aliceWs.send(ClientFrame.Call(bob.userId, "c1", CallSignal.Invite("offer-sdp")))
-            assertEquals(ServerFrame.Call(bob.userId, "Bob", "c1", CallSignal.End(EndReason.UNAVAILABLE)), aliceWs.receiveFrame())
-
             client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
                 val bobWs = this
                 assertEquals(ServerFrame.Synced, bobWs.receiveFrame())
-                aliceWs.send(ClientFrame.Call(bob.userId, "c2", CallSignal.Invite("offer-sdp")))
-                assertEquals(ServerFrame.Call(alice.userId, "Alice", "c2", CallSignal.Invite("offer-sdp")), bobWs.receiveFrame())
-                bobWs.send(ClientFrame.Call(alice.userId, "c2", CallSignal.Accept("answer-sdp")))
-                assertEquals(ServerFrame.Call(bob.userId, "Bob", "c2", CallSignal.Accept("answer-sdp")), aliceWs.receiveFrame())
+                aliceWs.send(ClientFrame.Call(bob.userId, "c1", CallSignal.Invite("offer-sdp")))
+                assertEquals(ServerFrame.Call(alice.userId, "Alice", "c1", CallSignal.Invite("offer-sdp")), bobWs.receiveFrame())
+                bobWs.send(ClientFrame.Call(alice.userId, "c1", CallSignal.Accept("answer-sdp")))
+                assertEquals(ServerFrame.Call(bob.userId, "Bob", "c1", CallSignal.Accept("answer-sdp")), aliceWs.receiveFrame())
             }
+        }
+    }
+
+    @Test
+    fun `a call to an offline user pushes them and is held until they connect`() = testApplication {
+        val pushes = mutableListOf<Pair<String, Push>>()
+        val store = Store.open(":memory:")
+        application { sorchat(store, { userId, push -> pushes += userId to push; userId != "nobody" }, createTempDirectory().toFile()) }
+        val client = createClient {
+            install(ContentNegotiation) { json(ProtocolJson) }
+            install(WebSockets)
+        }
+        val alice = client.register("Alice")
+        val bob = client.register("Bob")
+        val ice = CallSignal.Ice("0", 0, "candidate:1")
+
+        client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
+            val aliceWs = this
+            assertEquals(ServerFrame.Synced, aliceWs.receiveFrame())
+            aliceWs.send(ClientFrame.Call(bob.userId, "c1", CallSignal.Invite("offer-sdp")))
+            aliceWs.send(ClientFrame.Call(bob.userId, "c1", ice))
+
+            // Bob's device wakes up and connects: it gets the invite and the candidate sent meanwhile.
+            client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
+                val bobWs = this
+                assertEquals(ServerFrame.Call(alice.userId, "Alice", "c1", CallSignal.Invite("offer-sdp")), bobWs.receiveFrame())
+                assertEquals(ServerFrame.Call(alice.userId, "Alice", "c1", ice), bobWs.receiveFrame())
+                assertEquals(ServerFrame.Synced, bobWs.receiveFrame())
+                bobWs.send(ClientFrame.Call(alice.userId, "c1", CallSignal.Accept("answer-sdp")))
+                assertEquals(ServerFrame.Call(bob.userId, "Bob", "c1", CallSignal.Accept("answer-sdp")), aliceWs.receiveFrame())
+            }
+            assertEquals(listOf<Pair<String, Push>>(bob.userId to Push.IncomingCall("c1", alice.userId, "Alice")), pushes)
+
+            // A call the caller gives up on before the callee connects: the callee is told to stop ringing.
+            aliceWs.send(ClientFrame.Call(bob.userId, "c2", CallSignal.Invite("offer-sdp")))
+            aliceWs.send(ClientFrame.Call(bob.userId, "c2", CallSignal.End(EndReason.HANGUP)))
+            client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
+                assertEquals(ServerFrame.Synced, receiveFrame())
+            }
+            assertEquals(bob.userId to Push.CallEnded("c2"), pushes.last())
+        }
+    }
+
+    @Test
+    fun `a call to someone without a push token is unavailable`() = testApplication {
+        application { sorchat(Store.open(":memory:"), { _, _ -> false }, createTempDirectory().toFile()) }
+        val client = createClient {
+            install(ContentNegotiation) { json(ProtocolJson) }
+            install(WebSockets)
+        }
+        val alice = client.register("Alice")
+        val bob = client.register("Bob")
+        client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
+            assertEquals(ServerFrame.Synced, receiveFrame())
+            send(ClientFrame.Call(bob.userId, "c1", CallSignal.Invite("offer-sdp")))
+            assertEquals(ServerFrame.Call(bob.userId, "Bob", "c1", CallSignal.End(EndReason.UNAVAILABLE)), receiveFrame())
         }
     }
 

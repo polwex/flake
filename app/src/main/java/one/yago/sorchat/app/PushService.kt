@@ -15,6 +15,17 @@ class PushService : FirebaseMessagingService() {
     // Runs on a background thread, and the process may be killed shortly after it returns,
     // so the sync happens synchronously here.
     override fun onMessageReceived(message: RemoteMessage) {
-        runBlocking { ChatRepository.get(this@PushService).syncFromPush() }
+        val repository = ChatRepository.get(this)
+        val data = message.data
+        when (data["type"]) {
+            // The call rings right away; the repository connects to fetch its details.
+            "call" -> repository.calls.onIncomingPush(
+                callId = data["callId"] ?: return,
+                from = data["from"] ?: return,
+                fromName = data["fromName"] ?: "Unknown",
+            )
+            "call_end" -> repository.calls.onCancelledPush(data["callId"] ?: return)
+            else -> runBlocking { repository.syncFromPush() }
+        }
     }
 }

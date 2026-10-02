@@ -5,8 +5,15 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.Ringtone
 import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
+import android.telecom.DisconnectCause
 import android.util.Log
+import androidx.core.telecom.CallAttributesCompat
+import androidx.core.telecom.CallControlScope
+import androidx.core.telecom.CallEndpointCompat
+import androidx.core.telecom.CallsManager
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -18,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import one.yago.sorchat.protocol.CallSignal
 import one.yago.sorchat.protocol.EndReason
 import one.yago.sorchat.protocol.IceServer
@@ -54,8 +62,10 @@ data class Call(
 
 /**
  * 1:1 audio calls over WebRTC. Signaling goes through the chat WebSocket via [sendSignal].
- * All state changes run on one sequential dispatcher, so WebRTC callbacks (which arrive on
- * WebRTC's own threads) and user actions never race each other.
+ * Calls are registered with Android's Telecom framework (core-telecom), which lets them ring
+ * and run from the background, handles audio routing, and integrates with headsets and
+ * cellular calls. All state changes run on one sequential dispatcher, so WebRTC and Telecom
+ * callbacks (which arrive on their own threads) and user actions never race each other.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class CallManager(
@@ -66,18 +76,32 @@ class CallManager(
 ) {
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.Default.limitedParallelism(1))
     private val audioManager = context.getSystemService(AudioManager::class.java)
+    private val notifications = Notifications(context)
 
     private val _call = MutableStateFlow<Call?>(null)
     val call: StateFlow<Call?> = _call.asStateFlow()
 
     private var peerConnection: PeerConnection? = null
     private var audioTrack: AudioTrack? = null
-    private var pendingOffer: String? = null
+    /** The caller's offer. For a call announced by push, it arrives once the WebSocket connects. */
+    private var offer = CompletableDeferred<String>()
     /** Candidates that arrived before the remote description was set. */
     private val pendingIce = mutableListOf<IceCandidate>()
     private var remoteDescriptionSet = false
     private var ringtone: Ringtone? = null
     private var timeout: Job? = null
+
+    /** Null if this device doesn't support Telecom; calls then work only while the app is open. */
+    private val telecom: CallsManager? = try {
+        CallsManager(context).also { it.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE) }
+    } catch (e: Exception) {
+        Log.w(TAG, "Telecom unavailable", e)
+        null
+    }
+
+    @Volatile
+    private var control: CallControlScope? = null
+    private var endpoints: List<CallEndpointCompat> = emptyList()
 
     init {
         scope.launch { _call.collect { Log.d(TAG, "Call state: ${it?.phase} ${it?.endReason ?: ""}") } }
@@ -97,14 +121,15 @@ class CallManager(
 
     fun start(peer: Contact) = scope.launch {
         if (inCall) return@launch
+        resetConnectionState()
         val call = Call(UUID.randomUUID().toString(), peer, CallPhase.OUTGOING)
         _call.value = call
-        CallService.start(context, peer.name)
+        register(call, incoming = false)
         try {
             val pc = createPeerConnection(call)
-            val offer = pc.awaitCreate(offer = true)
-            pc.awaitSetLocal(offer)
-            send(CallSignal.Invite(offer.description))
+            val sdp = pc.awaitCreate(offer = true)
+            pc.awaitSetLocal(sdp)
+            send(CallSignal.Invite(sdp.description))
             timeout = scope.launch {
                 delay(RING_TIMEOUT)
                 if (_call.value?.let { it.id == call.id && it.phase == CallPhase.OUTGOING } == true) {
@@ -119,15 +144,28 @@ class CallManager(
         }
     }
 
+    /** A push announced an incoming call: start ringing right away; the offer follows over the WebSocket. */
+    fun onIncomingPush(callId: String, from: String, fromName: String) = scope.launch {
+        if (inCall) return@launch // busy: answered as such when the invite itself arrives
+        ring(Call(callId, Contact(from, fromName), CallPhase.INCOMING))
+    }
+
+    /** A push said the caller gave up before we connected. */
+    fun onCancelledPush(callId: String) = scope.launch {
+        val call = _call.value ?: return@launch
+        if (call.id == callId && call.phase == CallPhase.INCOMING) finish(EndReason.HANGUP)
+    }
+
     fun accept() = scope.launch {
         val call = _call.value?.takeIf { it.phase == CallPhase.INCOMING } ?: return@launch
-        val offer = pendingOffer ?: return@launch
         stopRinging()
         _call.value = call.copy(phase = CallPhase.CONNECTING)
-        CallService.start(context, call.peer.name)
+        control?.answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
+        CallService.update(context, call.peer.name, CallService.Mode.ONGOING, telecom = control != null)
         try {
+            val sdp = withTimeoutOrNull(OFFER_TIMEOUT) { offer.await() } ?: error("The call details never arrived")
             val pc = createPeerConnection(call)
-            pc.awaitSetRemote(SessionDescription(SessionDescription.Type.OFFER, offer))
+            pc.awaitSetRemote(SessionDescription(SessionDescription.Type.OFFER, sdp))
             onRemoteDescriptionSet(pc)
             val answer = pc.awaitCreate(offer = false)
             pc.awaitSetLocal(answer)
@@ -157,6 +195,18 @@ class CallManager(
     }
 
     fun setSpeaker(on: Boolean) = scope.launch {
+        val control = control
+        if (control != null) {
+            // Off means back to the most private route available: headset, then earpiece.
+            val target = if (on) {
+                endpoints.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
+            } else {
+                endpoints.filter { it.type != CallEndpointCompat.TYPE_SPEAKER }
+                    .minByOrNull { PRIVATE_ROUTES.indexOf(it.type).takeIf { i -> i >= 0 } ?: Int.MAX_VALUE }
+            }
+            target?.let { control.requestEndpointChange(it) }
+            return@launch // the new route is reported through currentCallEndpoint
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (on) {
                 audioManager.availableCommunicationDevices
@@ -177,14 +227,17 @@ class CallManager(
         val current = _call.value
         when (val signal = frame.signal) {
             is CallSignal.Invite -> {
-                if (inCall) {
-                    if (current?.id != frame.callId) sendSignal(frame.from, frame.callId, CallSignal.End(EndReason.BUSY))
+                if (current != null && current.id == frame.callId) {
+                    // Already ringing because of the push: this brings the offer.
+                    offer.complete(signal.sdp)
                     return@launch
                 }
-                resetConnectionState()
-                pendingOffer = signal.sdp
-                _call.value = Call(frame.callId, Contact(frame.from, frame.fromName), CallPhase.INCOMING)
-                startRinging()
+                if (inCall) {
+                    sendSignal(frame.from, frame.callId, CallSignal.End(EndReason.BUSY))
+                    return@launch
+                }
+                ring(Call(frame.callId, Contact(frame.from, frame.fromName), CallPhase.INCOMING))
+                offer.complete(signal.sdp)
             }
             else -> {
                 if (current == null || current.id != frame.callId || current.phase == CallPhase.ENDED) return@launch
@@ -208,6 +261,67 @@ class CallManager(
         }
     }
 
+    private fun ring(call: Call) {
+        resetConnectionState()
+        _call.value = call
+        register(call, incoming = true)
+        startRinging()
+        // If the caller's hang-up never reaches us (e.g. its push is lost), stop eventually.
+        timeout = scope.launch {
+            delay(RING_TIMEOUT + 15.seconds)
+            if (_call.value?.let { it.id == call.id && it.phase == CallPhase.INCOMING } == true) finish(EndReason.HANGUP)
+        }
+    }
+
+    /**
+     * Registers the call with Telecom, then starts [CallService]. Telecom calls may run a
+     * `phoneCall` foreground service from the background, which is what lets a pushed call ring.
+     */
+    private fun register(call: Call, incoming: Boolean) {
+        val telecom = telecom
+        val mode = if (incoming) CallService.Mode.INCOMING else CallService.Mode.ONGOING
+        if (telecom == null) {
+            CallService.update(context, call.peer.name, mode, telecom = false)
+            return
+        }
+        scope.launch {
+            try {
+                telecom.addCall(
+                    CallAttributesCompat(
+                        displayName = call.peer.name,
+                        address = Uri.fromParts("sorchat", call.peer.id, null),
+                        direction = if (incoming) CallAttributesCompat.DIRECTION_INCOMING else CallAttributesCompat.DIRECTION_OUTGOING,
+                        callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL,
+                    ),
+                    // Answered or ended from outside the app: a headset button, a watch, a cellular call.
+                    onAnswer = { accept() },
+                    onDisconnect = { if (_call.value?.id == call.id) { if (_call.value?.phase == CallPhase.INCOMING) decline() else hangUp() } },
+                    onSetActive = {},
+                    onSetInactive = {},
+                ) {
+                    scope.launch {
+                        if (_call.value?.id != call.id || !inCall) {
+                            // Ended while Telecom was still setting up.
+                            launch { disconnect(DisconnectCause(DisconnectCause.LOCAL)) }
+                            return@launch
+                        }
+                        control = this@addCall
+                        CallService.update(context, call.peer.name, mode, telecom = true)
+                    }
+                    launch { availableEndpoints.collect { endpoints = it } }
+                    launch {
+                        currentCallEndpoint.collect { endpoint ->
+                            _call.update { it?.copy(speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER) }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Telecom didn't accept the call", e)
+                if (_call.value?.id == call.id && inCall) CallService.update(context, call.peer.name, mode, telecom = false)
+            }
+        }
+    }
+
     private suspend fun createPeerConnection(call: Call): PeerConnection {
         val servers = iceServers().map { server ->
             PeerConnection.IceServer.builder(server.urls)
@@ -226,7 +340,8 @@ class CallManager(
         pc.addTrack(track, listOf("call"))
         peerConnection = pc
         audioTrack = track
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        // With Telecom, the system sets up call audio itself.
+        if (telecom == null) audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         return pc
     }
 
@@ -247,9 +362,23 @@ class CallManager(
         stopRinging()
         peerConnection?.dispose()
         resetConnectionState()
-        audioManager.mode = AudioManager.MODE_NORMAL
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) audioManager.clearCommunicationDevice()
+        if (telecom == null) {
+            audioManager.mode = AudioManager.MODE_NORMAL
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) audioManager.clearCommunicationDevice()
+        }
+        control?.let { c ->
+            val cause = when {
+                call.phase == CallPhase.INCOMING && reason == EndReason.DECLINED -> DisconnectCause.REJECTED
+                call.phase == CallPhase.INCOMING -> DisconnectCause.MISSED
+                reason == EndReason.BUSY -> DisconnectCause.BUSY
+                reason == EndReason.FAILED || reason == EndReason.UNAVAILABLE -> DisconnectCause.ERROR
+                else -> DisconnectCause.LOCAL
+            }
+            c.launch { c.disconnect(DisconnectCause(cause)) }
+        }
+        control = null
         CallService.stop(context)
+        if (call.phase == CallPhase.INCOMING && reason != EndReason.DECLINED) notifications.showMissedCall(call.peer)
         _call.value = call.copy(phase = CallPhase.ENDED, endReason = reason, noAnswer = noAnswer)
         // Show the outcome briefly, then go back to idle unless a new call started meanwhile.
         scope.launch {
@@ -261,9 +390,10 @@ class CallManager(
     private fun resetConnectionState() {
         peerConnection = null
         audioTrack = null
-        pendingOffer = null
+        offer = CompletableDeferred()
         pendingIce.clear()
         remoteDescriptionSet = false
+        endpoints = emptyList()
     }
 
     private fun startRinging() {
@@ -290,6 +420,7 @@ class CallManager(
                     PeerConnection.PeerConnectionState.CONNECTED ->
                         if (call.phase != CallPhase.ACTIVE) {
                             _call.value = call.copy(phase = CallPhase.ACTIVE, connectedAt = System.currentTimeMillis())
+                            control?.let { c -> c.launch { c.setActive() } }
                         }
                     PeerConnection.PeerConnectionState.FAILED -> {
                         send(CallSignal.End(EndReason.FAILED))
@@ -315,6 +446,13 @@ class CallManager(
     private companion object {
         const val TAG = "CallManager"
         val RING_TIMEOUT = 45.seconds
+        val OFFER_TIMEOUT = 15.seconds
+        /** Audio routes when the speaker is off, most preferred first. */
+        val PRIVATE_ROUTES = listOf(
+            CallEndpointCompat.TYPE_BLUETOOTH,
+            CallEndpointCompat.TYPE_WIRED_HEADSET,
+            CallEndpointCompat.TYPE_EARPIECE,
+        )
     }
 }
 

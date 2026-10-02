@@ -21,17 +21,31 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import org.slf4j.LoggerFactory
 
-/** Wakes a user's device when something is waiting for it while they're offline. */
+/** What a push tells the device. Pushes carry no message content. */
+sealed interface Push {
+    /** Messages are queued; the app should connect and fetch them. */
+    data object MessagesWaiting : Push
+
+    /** Someone is calling; the app should ring and connect to get the call details. */
+    data class IncomingCall(val callId: String, val callerId: String, val callerName: String) : Push
+
+    /** The caller gave up before the call was picked up; stop ringing. */
+    data class CallEnded(val callId: String) : Push
+}
+
+/** Wakes a user's device while it isn't connected. */
 fun interface Notifier {
-    suspend fun messageWaiting(userId: String)
+    /** Returns false if the user can't be reached (no push token registered). */
+    suspend fun push(userId: String, push: Push): Boolean
 }
 
 /** Used when FCM isn't configured: just logs what would be pushed. */
 class LogNotifier : Notifier {
     private val log = LoggerFactory.getLogger(LogNotifier::class.java)
 
-    override suspend fun messageWaiting(userId: String) {
-        log.info("push → {}: message waiting (FCM not configured)", userId)
+    override suspend fun push(userId: String, push: Push): Boolean {
+        log.info("push → {}: {} (FCM not configured)", userId, push)
+        return true
     }
 }
 
@@ -52,19 +66,20 @@ class FcmNotifier(private val store: Store, credentialsJson: String) : Notifier 
         projectId = requireNotNull(account.projectId) { "FCM credentials have no project_id" }
     }
 
-    override suspend fun messageWaiting(userId: String) {
+    override suspend fun push(userId: String, push: Push): Boolean {
         val token = store.pushToken(userId)
         if (token == null) {
             log.info("push → {}: no push token registered", userId)
-            return
+            return false
         }
         // Don't hold up the sender's connection on a round trip to Google.
         scope.launch {
-            runCatching { send(userId, token) }.onFailure { log.warn("push → {} failed", userId, it) }
+            runCatching { send(userId, token, push) }.onFailure { log.warn("push → {} failed", userId, it) }
         }
+        return true
     }
 
-    private suspend fun send(userId: String, token: String) {
+    private suspend fun send(userId: String, token: String, push: Push) {
         val accessToken = synchronized(credentials) {
             credentials.refreshIfExpired()
             checkNotNull(credentials.accessToken) { "Google returned no access token" }.tokenValue
@@ -72,11 +87,30 @@ class FcmNotifier(private val store: Store, credentialsJson: String) : Notifier 
         val body = buildJsonObject {
             putJsonObject("message") {
                 put("token", token)
-                putJsonObject("data") { put("type", "messages") }
+                putJsonObject("data") {
+                    when (push) {
+                        Push.MessagesWaiting -> put("type", "messages")
+                        is Push.IncomingCall -> {
+                            put("type", "call")
+                            put("callId", push.callId)
+                            put("from", push.callerId)
+                            put("fromName", push.callerName)
+                        }
+                        is Push.CallEnded -> {
+                            put("type", "call_end")
+                            put("callId", push.callId)
+                        }
+                    }
+                }
                 putJsonObject("android") {
                     put("priority", "HIGH")
-                    // Several pushes while the device is offline collapse into one wake-up.
-                    put("collapse_key", "messages")
+                    if (push == Push.MessagesWaiting) {
+                        // Several pushes while the device is offline collapse into one wake-up.
+                        put("collapse_key", "messages")
+                    } else {
+                        // A call that couldn't be delivered quickly is over anyway.
+                        put("ttl", "30s")
+                    }
                 }
             }
         }
@@ -85,7 +119,7 @@ class FcmNotifier(private val store: Store, credentialsJson: String) : Notifier 
             setBody(TextContent(body.toString(), ContentType.Application.Json))
         }
         when {
-            response.status.isSuccess() -> log.info("push → {}: sent", userId)
+            response.status.isSuccess() -> log.info("push → {}: {} sent", userId, push)
             response.status == HttpStatusCode.NotFound -> {
                 // UNREGISTERED: the app was uninstalled or the token rotated.
                 store.clearPushToken(userId, token)

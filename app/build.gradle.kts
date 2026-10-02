@@ -66,6 +66,7 @@ dependencies {
     ksp(libs.androidx.room.compiler)
 
     implementation(libs.stream.webrtc)
+    implementation(libs.androidx.core.telecom)
 
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.messaging)
