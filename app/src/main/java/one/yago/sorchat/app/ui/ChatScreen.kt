@@ -36,6 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import one.yago.sorchat.app.ChatMessage
 import one.yago.sorchat.app.Contact
 import one.yago.sorchat.app.MessageStatus
@@ -48,7 +49,12 @@ fun ChatScreen(
     connected: Boolean,
     onSend: (String) -> Unit,
     onBack: () -> Unit,
+    onVisible: (String?) -> Unit,
 ) {
+    LifecycleResumeEffect(contact.id) {
+        onVisible(contact.id)
+        onPauseOrDispose { onVisible(null) }
+    }
     var draft by rememberSaveable(contact.id) { mutableStateOf("") }
 
     Scaffold(

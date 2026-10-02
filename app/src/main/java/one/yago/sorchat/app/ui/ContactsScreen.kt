@@ -104,7 +104,7 @@ fun ContactsScreen(
             }
             LazyColumn(Modifier.fillMaxSize().padding(top = 8.dp)) {
                 items(state.contacts, key = Contact::id) { contact ->
-                    val last = state.messages[contact.id]?.lastOrNull()
+                    val last = state.lastMessages[contact.id]
                     ListItem(
                         headlineContent = { Text(contact.name) },
                         supportingContent = { Text(last?.body ?: contact.id, maxLines = 1) },

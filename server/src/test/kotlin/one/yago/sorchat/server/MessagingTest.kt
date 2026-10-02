@@ -9,6 +9,7 @@ import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -21,6 +22,7 @@ import io.ktor.websocket.readText
 import kotlinx.coroutines.withTimeout
 import one.yago.sorchat.protocol.ClientFrame
 import one.yago.sorchat.protocol.ProtocolJson
+import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
 import one.yago.sorchat.protocol.RegisterResponse
 import one.yago.sorchat.protocol.ServerFrame
@@ -58,6 +60,7 @@ class MessagingTest {
         val bob = client.register("Bob")
 
         client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
+            assertEquals(ServerFrame.Synced, receiveFrame())
             send(ClientFrame.Send("m1", bob.userId, "hi bob"))
             assertEquals(ServerFrame.Accepted("m1"), receiveFrame())
             // A retry with the same id is accepted again but not stored twice.
@@ -72,12 +75,15 @@ class MessagingTest {
             assertEquals(alice.userId, message.from)
             assertEquals("Alice", message.fromName)
             assertEquals("hi bob", message.body)
+            assertEquals(ServerFrame.Synced, receiveFrame())
             send(ClientFrame.Ack("m1"))
         }
 
-        // After the ack, a reconnect delivers nothing old: the first frame is a fresh live message.
+        // After the ack, a reconnect delivers nothing old: the queue is empty, then a live message arrives.
         client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
+            assertEquals(ServerFrame.Synced, receiveFrame())
             client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
+                assertEquals(ServerFrame.Synced, receiveFrame())
                 send(ClientFrame.Send("m2", bob.userId, "still there?"))
                 assertEquals(ServerFrame.Accepted("m2"), receiveFrame())
             }
@@ -91,9 +97,32 @@ class MessagingTest {
         val alice = client.register("Alice")
 
         client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
+            assertEquals(ServerFrame.Synced, receiveFrame())
             send(ClientFrame.Send("m1", "nobody", "hello?"))
             assertEquals(ServerFrame.Error("m1", "unknown recipient"), receiveFrame())
         }
         assertEquals(HttpStatusCode.Unauthorized, client.get("/users/${alice.userId}") { bearerAuth("wrong") }.status)
+    }
+
+    @Test
+    fun `push token is stored per user`() = testApplication {
+        val store = Store.open(":memory:")
+        application { sorchat(store) {} }
+        val client = createClient { install(ContentNegotiation) { json(ProtocolJson) } }
+        val alice = client.register("Alice")
+
+        val response = client.put("/push-token") {
+            bearerAuth(alice.token)
+            contentType(ContentType.Application.Json)
+            setBody(PushTokenRequest("fcm-token-1"))
+        }
+        assertEquals(HttpStatusCode.NoContent, response.status)
+        assertEquals("fcm-token-1", store.pushToken(alice.userId))
+
+        // A stale token is only cleared if it's still the current one.
+        store.clearPushToken(alice.userId, "older-token")
+        assertEquals("fcm-token-1", store.pushToken(alice.userId))
+        store.clearPushToken(alice.userId, "fcm-token-1")
+        assertEquals(null, store.pushToken(alice.userId))
     }
 }

@@ -3,144 +3,109 @@ package one.yago.sorchat.app
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import one.yago.sorchat.protocol.ClientFrame
-import one.yago.sorchat.protocol.ServerFrame
-import java.util.UUID
-
-enum class MessageStatus { SENDING, SENT, FAILED, RECEIVED }
-
-data class ChatMessage(
-    val id: String,
-    val fromMe: Boolean,
-    val body: String,
-    val sentAt: Long,
-    val status: MessageStatus,
-)
 
 data class UiState(
     val me: Identity? = null,
     val contacts: List<Contact> = emptyList(),
-    /** Conversations keyed by contact id, oldest message first. */
-    val messages: Map<String, List<ChatMessage>> = emptyMap(),
+    /** Newest message per contact id. */
+    val lastMessages: Map<String, ChatMessage> = emptyMap(),
     val openChat: String? = null,
+    /** Messages of [openChat], oldest first. */
+    val conversation: List<ChatMessage> = emptyList(),
     val connected: Boolean = false,
     val busy: Boolean = false,
     val error: String? = null,
 )
 
+/** State owned by the ViewModel itself; everything else comes from [ChatRepository]. */
+private data class LocalState(
+    val openChat: String? = null,
+    val busy: Boolean = false,
+    val error: String? = null,
+)
+
+private data class Session(val me: Identity?, val connected: Boolean, val notice: String?)
+
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
-    private val prefs = Prefs(app)
-    private val client = ChatClient(BuildConfig.SERVER_URL)
-    private var connection: Job? = null
+    private val repo = ChatRepository.get(app)
+    private val local = MutableStateFlow(LocalState())
 
-    private val _state = MutableStateFlow(UiState(me = prefs.identity, contacts = prefs.contacts))
-    val state: StateFlow<UiState> = _state.asStateFlow()
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val conversation = local.map { it.openChat }.distinctUntilChanged()
+        .flatMapLatest { peer -> if (peer == null) flowOf(emptyList()) else repo.dao.conversation(peer) }
 
-    init {
-        viewModelScope.launch { client.connected.collect { c -> _state.update { it.copy(connected = c) } } }
-        state.value.me?.let(::connect)
-    }
+    private val session = combine(repo.identity, repo.connected, repo.notice, ::Session)
+
+    val state: StateFlow<UiState> = combine(
+        local, session, repo.dao.contacts(), repo.dao.lastMessages(), conversation,
+    ) { local, session, contacts, lastMessages, conversation ->
+        UiState(
+            me = session.me,
+            contacts = contacts,
+            lastMessages = lastMessages.associateBy { it.peer },
+            openChat = local.openChat,
+            conversation = conversation,
+            connected = session.connected,
+            busy = local.busy,
+            error = local.error ?: session.notice,
+        )
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState(me = repo.identity.value))
 
     fun register(name: String) {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return
-        viewModelScope.launch {
-            _state.update { it.copy(busy = true, error = null) }
-            runCatching { client.register(trimmed) }
-                .onSuccess { response ->
-                    val me = Identity(response.userId, trimmed, response.token)
-                    prefs.identity = me
-                    _state.update { it.copy(me = me, busy = false) }
-                    connect(me)
-                }
-                .onFailure { e -> _state.update { it.copy(busy = false, error = "Couldn't register: ${e.message}") } }
-        }
+        runBusy("Couldn't register") { repo.register(trimmed) }
     }
 
     fun addContact(rawId: String) {
-        val me = state.value.me ?: return
+        val me = repo.identity.value ?: return
         val id = rawId.trim().lowercase()
         if (id.isEmpty() || id == me.id || state.value.contacts.any { it.id == id }) return
-        viewModelScope.launch {
-            _state.update { it.copy(busy = true, error = null) }
-            runCatching { client.lookUp(me.token, id) }
-                .onSuccess { info ->
-                    if (info == null) _state.update { it.copy(busy = false, error = "No user with ID \"$id\"") }
-                    else {
-                        saveContact(Contact(info.id, info.name))
-                        _state.update { it.copy(busy = false) }
-                    }
-                }
-                .onFailure { e -> _state.update { it.copy(busy = false, error = "Couldn't add contact: ${e.message}") } }
+        runBusy("Couldn't add contact") {
+            if (!repo.addContact(id)) local.update { it.copy(error = "No user with ID \"$id\"") }
         }
     }
 
-    fun openChat(contactId: String?) = _state.update { it.copy(openChat = contactId) }
+    fun openChat(contactId: String?) = local.update { it.copy(openChat = contactId) }
 
-    fun dismissError() = _state.update { it.copy(error = null) }
+    /** Called while a chat is on screen, so its messages don't also raise notifications. */
+    fun setVisibleChat(contactId: String?) {
+        repo.visibleChat = contactId
+    }
+
+    fun dismissError() {
+        local.update { it.copy(error = null) }
+        repo.notice.value = null
+    }
 
     fun send(text: String) {
-        val peer = state.value.openChat ?: return
+        val peer = local.value.openChat ?: return
         val body = text.trim().ifEmpty { return }
-        val message = ChatMessage(UUID.randomUUID().toString(), fromMe = true, body, System.currentTimeMillis(), MessageStatus.SENDING)
-        addMessage(peer, message)
-        // If we're offline, it's sent from resendPending() once the connection is back.
-        client.send(ClientFrame.Send(message.id, peer, body))
+        viewModelScope.launch { repo.send(peer, body) }
     }
 
-    private fun connect(me: Identity) {
-        connection?.cancel()
-        connection = viewModelScope.launch {
+    private fun runBusy(failure: String, block: suspend () -> Unit) {
+        viewModelScope.launch {
+            local.update { it.copy(busy = true, error = null) }
             try {
-                client.run(me.token, onConnected = ::resendPending, onFrame = ::handle)
-            } catch (_: UnauthorizedException) {
-                prefs.identity = null
-                _state.update { UiState(contacts = it.contacts, error = "The server no longer knows this account. Please register again.") }
+                block()
+            } catch (e: Exception) {
+                local.update { it.copy(error = "$failure: ${e.message}") }
+            } finally {
+                local.update { it.copy(busy = false) }
             }
         }
-    }
-
-    /** The server dedupes by message id, so resending something it already has is harmless. */
-    private fun resendPending() {
-        for ((peer, messages) in state.value.messages) {
-            for (m in messages) if (m.status == MessageStatus.SENDING) client.send(ClientFrame.Send(m.id, peer, m.body))
-        }
-    }
-
-    private fun handle(frame: ServerFrame) {
-        when (frame) {
-            is ServerFrame.Message -> {
-                if (state.value.contacts.none { it.id == frame.from }) saveContact(Contact(frame.from, frame.fromName))
-                val known = state.value.messages[frame.from].orEmpty().any { it.id == frame.id }
-                if (!known) addMessage(frame.from, ChatMessage(frame.id, fromMe = false, frame.body, frame.sentAt, MessageStatus.RECEIVED))
-                // Ack even duplicates: it means the server's earlier copy wasn't deleted yet.
-                client.send(ClientFrame.Ack(frame.id))
-            }
-            is ServerFrame.Accepted -> setStatus(frame.id, MessageStatus.SENT)
-            is ServerFrame.Error -> {
-                val id = frame.id
-                if (id != null) setStatus(id, MessageStatus.FAILED)
-                else _state.update { it.copy(error = frame.reason) }
-            }
-        }
-    }
-
-    private fun saveContact(contact: Contact) {
-        _state.update { it.copy(contacts = it.contacts + contact) }
-        prefs.contacts = state.value.contacts
-    }
-
-    private fun addMessage(peer: String, message: ChatMessage) = _state.update {
-        it.copy(messages = it.messages + (peer to (it.messages[peer].orEmpty() + message)))
-    }
-
-    private fun setStatus(id: String, status: MessageStatus) = _state.update { s ->
-        s.copy(messages = s.messages.mapValues { (_, list) -> list.map { if (it.id == id) it.copy(status = status) else it } })
     }
 }

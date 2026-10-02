@@ -22,3 +22,4 @@ captures/
 # Server data
 server/data/
 *.db
+bulk

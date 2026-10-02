@@ -22,6 +22,10 @@ data class RegisterResponse(val userId: String, val token: String)
 @Serializable
 data class UserInfo(val id: String, val name: String)
 
+/** Registers the device's FCM token so the server can wake it when messages are waiting. */
+@Serializable
+data class PushTokenRequest(val token: String)
+
 // ---- WebSocket ----
 
 /** Frames sent from a client to the server. */
@@ -59,6 +63,11 @@ sealed interface ServerFrame {
         val body: String,
         val sentAt: Long,
     ) : ServerFrame
+
+    /** All messages queued while the client was offline have been sent. */
+    @Serializable
+    @SerialName("synced")
+    data object Synced : ServerFrame
 
     @Serializable
     @SerialName("error")

@@ -29,6 +29,7 @@ class Hub(private val store: Store, private val notifier: Notifier) {
         log.info("{} connected", user.id)
         try {
             for (message in store.pendingFor(user.id)) session.sendFrame(message)
+            session.sendFrame(ServerFrame.Synced)
             for (frame in session.incoming) {
                 if (frame !is Frame.Text) continue
                 val parsed = runCatching { ProtocolJson.decodeFromString(ClientFrame.serializer(), frame.readText()) }

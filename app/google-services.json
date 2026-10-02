@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "349743559423",
+    "project_id": "sorchat-80c1b",
+    "storage_bucket": "sorchat-80c1b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:349743559423:android:65029f5e9a7cdc94be12ca",
+        "android_client_info": {
+          "package_name": "one.yago.sorchat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDyNLs6q8mSUVleabGjJh8p1MK0aSRjuJQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

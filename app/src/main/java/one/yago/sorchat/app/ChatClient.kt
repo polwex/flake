@@ -11,6 +11,7 @@ import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -19,14 +20,17 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.DefaultWebSocketSession
 import io.ktor.websocket.Frame
+import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.SerializationException
 import one.yago.sorchat.protocol.ClientFrame
 import one.yago.sorchat.protocol.ProtocolJson
+import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
 import one.yago.sorchat.protocol.RegisterResponse
 import one.yago.sorchat.protocol.ServerFrame
@@ -70,6 +74,53 @@ class ChatClient(private val baseUrl: String) {
         return session?.outgoing?.trySend(Frame.Text(text))?.isSuccess ?: false
     }
 
+    suspend fun registerPushToken(token: String, pushToken: String) {
+        http.put("$baseUrl/push-token") {
+            bearerAuth(token)
+            contentType(ContentType.Application.Json)
+            setBody(PushTokenRequest(pushToken))
+        }
+    }
+
+    /** Closes the current connection gracefully, after anything already queued has been sent. */
+    suspend fun disconnect() {
+        session?.close()
+    }
+
+    /**
+     * Opens one WebSocket and processes frames until it closes.
+     * Throws [UnauthorizedException] if the server rejects our token.
+     */
+    suspend fun session(
+        token: String,
+        onConnected: suspend () -> Unit,
+        onFrame: suspend (ServerFrame) -> Unit,
+    ) {
+        http.webSocket(urlString = baseUrl.replaceFirst("http", "ws") + "/ws", request = { bearerAuth(token) }) {
+            session = this
+            _connected.value = true
+            try {
+                onConnected()
+                for (frame in incoming) {
+                    if (frame !is Frame.Text) continue
+                    val parsed = try {
+                        ProtocolJson.decodeFromString(ServerFrame.serializer(), frame.readText())
+                    } catch (e: SerializationException) {
+                        Log.w(TAG, "Ignoring frame this version doesn't understand", e)
+                        continue
+                    }
+                    onFrame(parsed)
+                }
+                if (closeReason.await()?.code == CloseReason.Codes.VIOLATED_POLICY.code) {
+                    throw UnauthorizedException()
+                }
+            } finally {
+                session = null
+                _connected.value = false
+            }
+        }
+    }
+
     /**
      * Keeps a WebSocket open, reconnecting with exponential backoff, until the calling coroutine
      * is cancelled. Throws [UnauthorizedException] if the server rejects our token.
@@ -79,32 +130,23 @@ class ChatClient(private val baseUrl: String) {
         onConnected: suspend () -> Unit,
         onFrame: suspend (ServerFrame) -> Unit,
     ) {
-        val wsUrl = baseUrl.replaceFirst("http", "ws") + "/ws"
         var backoff = 1.seconds
         while (true) {
             try {
-                http.webSocket(urlString = wsUrl, request = { bearerAuth(token) }) {
-                    session = this
-                    _connected.value = true
-                    backoff = 1.seconds
-                    onConnected()
-                    for (frame in incoming) {
-                        if (frame !is Frame.Text) continue
-                        onFrame(ProtocolJson.decodeFromString(ServerFrame.serializer(), frame.readText()))
-                    }
-                    if (closeReason.await()?.code == CloseReason.Codes.VIOLATED_POLICY.code) {
-                        throw UnauthorizedException()
-                    }
-                }
+                session(
+                    token,
+                    onConnected = {
+                        backoff = 1.seconds
+                        onConnected()
+                    },
+                    onFrame = onFrame,
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: UnauthorizedException) {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Connection failed, retrying in $backoff", e)
-            } finally {
-                session = null
-                _connected.value = false
             }
             delay(backoff)
             backoff = (backoff * 2).coerceAtMost(30.seconds)

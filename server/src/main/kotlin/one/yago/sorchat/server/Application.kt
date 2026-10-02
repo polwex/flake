@@ -5,6 +5,7 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.install
+import io.ktor.server.application.log
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.BadRequestException
@@ -14,6 +15,7 @@ import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
+import io.ktor.server.routing.put
 import io.ktor.server.routing.routing
 import io.ktor.server.websocket.WebSockets
 import io.ktor.server.websocket.pingPeriod
@@ -24,8 +26,10 @@ import io.ktor.websocket.close
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import one.yago.sorchat.protocol.ProtocolJson
+import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
 import one.yago.sorchat.protocol.UserInfo
+import java.io.File
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.seconds
@@ -36,8 +40,14 @@ private val MESSAGE_TTL = 30.days
 fun main() {
     val port = System.getenv("PORT")?.toInt() ?: 8080
     val dbPath = System.getenv("SORCHAT_DB") ?: "data/sorchat.db"
+    val store = Store.open(dbPath)
+    // Firebase service-account key, given as JSON content or as a file path; without it, pushes are only logged.
+    val fcmCredentials = System.getenv("SORCHAT_FCM_CREDENTIALS_JSON")?.takeIf { it.isNotBlank() }
+        ?: System.getenv("SORCHAT_FCM_CREDENTIALS")?.takeIf { it.isNotBlank() }?.let { File(it).readText() }
+    val notifier = fcmCredentials?.let { FcmNotifier(store, it) } ?: LogNotifier()
     embeddedServer(Netty, port = port, host = "0.0.0.0") {
-        sorchat(Store.open(dbPath), LogNotifier())
+        log.info("Push notifications via {}", notifier::class.simpleName)
+        sorchat(store, notifier)
     }.start(wait = true)
 }
 
@@ -74,6 +84,16 @@ fun Application.sorchat(store: Store, notifier: Notifier) {
                 return@post
             }
             call.respond(store.createUser(name))
+        }
+
+        put("/push-token") {
+            val user = call.user()
+            if (user == null) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@put
+            }
+            store.setPushToken(user.id, call.receive<PushTokenRequest>().token)
+            call.respond(HttpStatusCode.NoContent)
         }
 
         get("/users/{id}") {

@@ -9,6 +9,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.sql.Connection
 import java.sql.DriverManager
+import java.sql.Statement
 import java.util.Base64
 
 data class User(val id: String, val name: String)
@@ -54,6 +55,30 @@ class Store private constructor(private val conn: Connection) {
         prepareStatement("SELECT id, name FROM users WHERE token_hash = ?").use {
             it.setString(1, hash(token))
             it.executeQuery().use { rs -> if (rs.next()) User(rs.getString(1), rs.getString(2)) else null }
+        }
+    }
+
+    suspend fun setPushToken(userId: String, token: String) = db {
+        prepareStatement("UPDATE users SET push_token = ? WHERE id = ?").use {
+            it.setString(1, token)
+            it.setString(2, userId)
+            it.executeUpdate()
+        }
+    }
+
+    suspend fun pushToken(userId: String): String? = db {
+        prepareStatement("SELECT push_token FROM users WHERE id = ?").use {
+            it.setString(1, userId)
+            it.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
+        }
+    }
+
+    /** Forgets a token FCM reported as invalid, unless the device has registered a new one since. */
+    suspend fun clearPushToken(userId: String, token: String) = db {
+        prepareStatement("UPDATE users SET push_token = NULL WHERE id = ? AND push_token = ?").use {
+            it.setString(1, userId)
+            it.setString(2, token)
+            it.executeUpdate()
         }
     }
 
@@ -120,6 +145,14 @@ class Store private constructor(private val conn: Connection) {
         /** Lowercase letters and digits without look-alikes (0/o, 1/l/i), so ids are easy to type. */
         private const val ID_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 
+        /** Additive schema changes for databases created by older versions. */
+        private fun migrate(st: Statement) {
+            val userColumns = st.executeQuery("PRAGMA table_info(users)").use { rs ->
+                buildSet { while (rs.next()) add(rs.getString("name")) }
+            }
+            if ("push_token" !in userColumns) st.execute("ALTER TABLE users ADD COLUMN push_token TEXT")
+        }
+
         fun open(path: String): Store {
             if (path != ":memory:") File(path).absoluteFile.parentFile.mkdirs()
             val conn = DriverManager.getConnection("jdbc:sqlite:$path")
@@ -148,6 +181,7 @@ class Store private constructor(private val conn: Connection) {
                     """
                 )
                 st.execute("CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, sent_at)")
+                migrate(st)
             }
             return Store(conn)
         }
