@@ -9,6 +9,8 @@
 #         enable = true;
 #         domain = "chat.urbit.men";
 #         fcmCredentialsFile = "/run/secrets/sorchat-fcm.json";
+#         passkeys.androidCertFingerprints = [ "02:AE:…" ];   # ./gradlew :app:signingReport
+#         backup.enable = true;
 #       };
 #     }
 #   ];
@@ -47,6 +49,24 @@ in {
       type = types.nullOr types.path;
       default = null;
       description = "Firebase service-account JSON for push notifications. Without it, pushes are only logged.";
+    };
+
+    passkeys = {
+      androidCertFingerprints = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        example = ["02:AE:F3:83:0F:1D:1D:6D:9F:15:1B:AC:3D:7A:61:0C:6E:C2:5F:EE:D0:69:BF:94:80:C3:78:03:1A:E1:90:99"];
+        description = ''
+          SHA-256 fingerprints of the certificates the Android app is signed with
+          (`./gradlew :app:signingReport`). Enables passkey sign-in for `domain`; empty disables it.
+        '';
+      };
+
+      androidPackage = mkOption {
+        type = types.str;
+        default = "one.yago.sorchat";
+        description = "The Android app's package name.";
+      };
     };
 
     backup = {
@@ -146,6 +166,11 @@ in {
         # %d is the directory where systemd puts the LoadCredential files below.
         // lib.optionalAttrs (cfg.fcmCredentialsFile != null) {
           SORCHAT_FCM_CREDENTIALS = "%d/fcm.json";
+        }
+        // lib.optionalAttrs (cfg.passkeys.androidCertFingerprints != []) {
+          SORCHAT_PASSKEY_RP_ID = cfg.domain;
+          SORCHAT_ANDROID_PACKAGE = cfg.passkeys.androidPackage;
+          SORCHAT_ANDROID_CERT_SHA256 = lib.concatStringsSep "," cfg.passkeys.androidCertFingerprints;
         }
         // lib.optionalAttrs (cfg.turn.domain != null && cfg.turn.secretFile != null) {
           SORCHAT_TURN_SECRET_FILE = "%d/turn-secret";

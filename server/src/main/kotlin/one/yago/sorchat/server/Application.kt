@@ -17,6 +17,7 @@ import io.ktor.server.request.contentType
 import io.ktor.server.request.receive
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.put
@@ -35,6 +36,8 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import one.yago.sorchat.protocol.IceServersResponse
+import one.yago.sorchat.protocol.LoginResponse
+import one.yago.sorchat.protocol.PasskeyResponse
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
@@ -62,14 +65,28 @@ fun main() {
         secret = (System.getenv("SORCHAT_TURN_SECRET") ?: System.getenv("SORCHAT_TURN_SECRET_FILE")?.let { File(it).readText() })
             ?.trim()?.takeIf { it.isNotEmpty() },
     )
+    // Passkeys need the domain the app talks to and the app's signing certificate fingerprints, e.g.
+    // SORCHAT_PASSKEY_RP_ID=chat.example.com SORCHAT_ANDROID_CERT_SHA256=AB:CD:…[,…]
+    val passkeys = System.getenv("SORCHAT_PASSKEY_RP_ID")?.takeIf { it.isNotBlank() }?.let { rpId ->
+        val fingerprints = System.getenv("SORCHAT_ANDROID_CERT_SHA256")?.split(",")?.map(String::trim)?.filter(String::isNotEmpty).orEmpty()
+        PasskeyConfig(rpId, System.getenv("SORCHAT_ANDROID_PACKAGE") ?: "one.yago.sorchat", fingerprints)
+    }
     embeddedServer(Netty, port = port, host = host) {
         log.info("Push notifications via {}", notifier::class.simpleName)
         log.info("ICE servers: {}", ice.describe())
-        sorchat(store, notifier, mediaDir, ice)
+        log.info("Passkeys: {}", passkeys?.let { "for ${it.rpId}, ${it.certFingerprints.size} app certificate(s)" } ?: "disabled")
+        sorchat(store, notifier, mediaDir, ice, passkeys)
     }.start(wait = true)
 }
 
-fun Application.sorchat(store: Store, notifier: Notifier, mediaDir: File, ice: IceConfig = IceConfig()) {
+fun Application.sorchat(
+    store: Store,
+    notifier: Notifier,
+    mediaDir: File,
+    ice: IceConfig = IceConfig(),
+    passkeyConfig: PasskeyConfig? = null,
+) {
+    val passkeys = passkeyConfig?.let { Passkeys(store, it) }
     val media = MediaStore(mediaDir, store)
     val hub = Hub(store, media, notifier)
 
@@ -80,6 +97,7 @@ fun Application.sorchat(store: Store, notifier: Notifier, mediaDir: File, ice: I
     }
     install(StatusPages) {
         exception<BadRequestException> { call, _ -> call.respond(HttpStatusCode.BadRequest) }
+        exception<PasskeyException> { call, e -> call.respond(HttpStatusCode.BadRequest, e.message ?: "passkey error") }
     }
 
     launch {
@@ -141,6 +159,49 @@ fun Application.sorchat(store: Store, notifier: Notifier, mediaDir: File, ice: I
             val found = media.find(call.parameters["id"]!!)
             if (found == null) call.respond(HttpStatusCode.NotFound)
             else call.respond(LocalFileContent(media.file(found), ContentType.parse(found.mimeType)))
+        }
+
+        // Digital Asset Links: lets the Android app use passkeys for this domain.
+        get("/.well-known/assetlinks.json") {
+            if (passkeyConfig == null) call.respond(HttpStatusCode.NotFound)
+            else call.respondText(passkeyConfig.assetLinksJson, ContentType.Application.Json)
+        }
+
+        post("/passkey/register/start") {
+            val user = call.user()
+            when {
+                passkeys == null -> call.respond(HttpStatusCode.NotFound)
+                user == null -> call.respond(HttpStatusCode.Unauthorized)
+                else -> call.respond(passkeys.startRegistration(user))
+            }
+        }
+
+        post("/passkey/register/finish") {
+            val user = call.user()
+            when {
+                passkeys == null -> call.respond(HttpStatusCode.NotFound)
+                user == null -> call.respond(HttpStatusCode.Unauthorized)
+                else -> {
+                    passkeys.finishRegistration(user, call.receive<PasskeyResponse>())
+                    call.respond(HttpStatusCode.NoContent)
+                }
+            }
+        }
+
+        post("/passkey/login/start") {
+            if (passkeys == null) call.respond(HttpStatusCode.NotFound)
+            else call.respond(passkeys.startLogin())
+        }
+
+        // Signing in with a passkey issues a new token, so the account moves to this device.
+        post("/passkey/login/finish") {
+            if (passkeys == null) {
+                call.respond(HttpStatusCode.NotFound)
+                return@post
+            }
+            val userId = passkeys.finishLogin(call.receive<PasskeyResponse>())
+            val user = checkNotNull(store.findUser(userId))
+            call.respond(LoginResponse(user.id, user.name, store.issueToken(user.id)))
         }
 
         get("/ice-servers") {

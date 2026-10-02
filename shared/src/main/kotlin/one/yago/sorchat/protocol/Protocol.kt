@@ -22,6 +22,21 @@ data class RegisterResponse(val userId: String, val token: String)
 @Serializable
 data class UserInfo(val id: String, val name: String)
 
+/**
+ * WebAuthn options for a passkey ceremony, as JSON to hand to Android's Credential Manager
+ * unchanged. [requestId] ties the response back to these options.
+ */
+@Serializable
+data class PasskeyOptions(val requestId: String, val optionsJson: String)
+
+/** The Credential Manager's response JSON for a [PasskeyOptions] request. */
+@Serializable
+data class PasskeyResponse(val requestId: String, val responseJson: String)
+
+/** A successful passkey sign-in: a fresh token for the account. */
+@Serializable
+data class LoginResponse(val userId: String, val name: String, val token: String)
+
 /** Response to `POST /media`: the id to reference the upload by in a message's [Attachment]. */
 @Serializable
 data class UploadResponse(val mediaId: String)

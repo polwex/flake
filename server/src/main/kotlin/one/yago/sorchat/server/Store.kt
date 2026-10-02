@@ -18,6 +18,9 @@ data class User(val id: String, val name: String)
 
 data class Media(val id: String, val owner: String, val mimeType: String, val size: Long)
 
+/** A registered passkey. Binary fields are base64url-encoded. */
+data class Passkey(val credentialId: String, val userId: String, val publicKeyCose: String, val signCount: Long)
+
 enum class StoreResult { STORED, DUPLICATE, CONFLICT }
 
 /**
@@ -32,7 +35,7 @@ class Store private constructor(private val conn: Connection) {
         withContext(Dispatchers.IO) { synchronized(lock) { conn.block() } }
 
     suspend fun createUser(name: String): RegisterResponse = db {
-        val token = ByteArray(32).also(random::nextBytes).let(Base64.getUrlEncoder().withoutPadding()::encodeToString)
+        val token = newToken()
         var id: String
         do id = newUserId() while (!insertUser(id, name, hash(token)))
         RegisterResponse(id, token)
@@ -52,6 +55,50 @@ class Store private constructor(private val conn: Connection) {
         prepareStatement("SELECT id, name FROM users WHERE id = ?").use {
             it.setString(1, id)
             it.executeQuery().use { rs -> if (rs.next()) User(rs.getString(1), rs.getString(2)) else null }
+        }
+    }
+
+    /** Replaces the user's token (logging out whichever device had the old one) and returns the new one. */
+    suspend fun issueToken(userId: String): String = db {
+        val token = newToken()
+        prepareStatement("UPDATE users SET token_hash = ? WHERE id = ?").use {
+            it.setString(1, hash(token))
+            it.setString(2, userId)
+            check(it.executeUpdate() == 1) { "No user $userId" }
+        }
+        token
+    }
+
+    suspend fun addPasskey(passkey: Passkey) = db {
+        prepareStatement("INSERT INTO passkeys(credential_id, user_id, public_key_cose, sign_count, created_at) VALUES (?, ?, ?, ?, ?)").use {
+            it.setString(1, passkey.credentialId)
+            it.setString(2, passkey.userId)
+            it.setString(3, passkey.publicKeyCose)
+            it.setLong(4, passkey.signCount)
+            it.setLong(5, System.currentTimeMillis())
+            it.executeUpdate()
+        }
+    }
+
+    suspend fun passkey(credentialId: String): Passkey? = db {
+        prepareStatement("SELECT credential_id, user_id, public_key_cose, sign_count FROM passkeys WHERE credential_id = ?").use {
+            it.setString(1, credentialId)
+            it.executeQuery().use { rs -> if (rs.next()) Passkey(rs.getString(1), rs.getString(2), rs.getString(3), rs.getLong(4)) else null }
+        }
+    }
+
+    suspend fun passkeysFor(userId: String): List<Passkey> = db {
+        prepareStatement("SELECT credential_id, user_id, public_key_cose, sign_count FROM passkeys WHERE user_id = ?").use {
+            it.setString(1, userId)
+            it.executeQuery().use { rs -> buildList { while (rs.next()) add(Passkey(rs.getString(1), rs.getString(2), rs.getString(3), rs.getLong(4))) } }
+        }
+    }
+
+    suspend fun updatePasskeySignCount(credentialId: String, signCount: Long) = db {
+        prepareStatement("UPDATE passkeys SET sign_count = ? WHERE credential_id = ?").use {
+            it.setLong(1, signCount)
+            it.setString(2, credentialId)
+            it.executeUpdate()
         }
     }
 
@@ -179,6 +226,8 @@ class Store private constructor(private val conn: Connection) {
         }
     }
 
+    private fun newToken(): String = ByteArray(32).also(random::nextBytes).let(Base64.getUrlEncoder().withoutPadding()::encodeToString)
+
     private fun newUserId(): String = buildString {
         repeat(8) { append(ID_ALPHABET[random.nextInt(ID_ALPHABET.length)]) }
     }
@@ -227,6 +276,18 @@ class Store private constructor(private val conn: Connection) {
                     """
                 )
                 st.execute("CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, sent_at)")
+                st.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS passkeys (
+                        credential_id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        public_key_cose TEXT NOT NULL,
+                        sign_count INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                st.execute("CREATE INDEX IF NOT EXISTS passkeys_user ON passkeys(user_id)")
                 st.execute(
                     """
                     CREATE TABLE IF NOT EXISTS media (

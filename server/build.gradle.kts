@@ -29,6 +29,7 @@ dependencies {
     implementation(libs.ktor.serialization.kotlinx.json)
     implementation(libs.ktor.client.cio)
     implementation(libs.google.auth)
+    implementation(libs.webauthn.server)
     implementation(libs.sqlite.jdbc)
     implementation(libs.logback.classic)
 
