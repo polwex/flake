@@ -36,14 +36,19 @@ class CallService : Service() {
         }
         val mode = intent?.getStringExtra(EXTRA_MODE)?.let(Mode::valueOf) ?: Mode.ONGOING
         val telecom = intent?.getBooleanExtra(EXTRA_TELECOM, false) ?: false
+        val camera = intent?.getBooleanExtra(EXTRA_CAMERA, false) ?: false
+        val video = intent?.getBooleanExtra(EXTRA_VIDEO, false) ?: false
         val peer = Person.Builder().setName(intent?.getStringExtra(EXTRA_PEER_NAME) ?: "Call").setImportant(true).build()
 
         val notification = when (mode) {
             Mode.INCOMING -> NotificationCompat.Builder(this, Notifications.CHANNEL_INCOMING_CALLS)
-                .setStyle(NotificationCompat.CallStyle.forIncomingCall(peer, serviceIntent(ACTION_DECLINE), activityIntent(MainActivity.ACTION_ANSWER)))
+                .setStyle(
+                    NotificationCompat.CallStyle.forIncomingCall(peer, serviceIntent(ACTION_DECLINE), activityIntent(MainActivity.ACTION_ANSWER))
+                        .setIsVideo(video)
+                )
                 .setFullScreenIntent(activityIntent(null), true)
             Mode.ONGOING -> NotificationCompat.Builder(this, Notifications.CHANNEL_CALLS)
-                .setStyle(NotificationCompat.CallStyle.forOngoingCall(peer, serviceIntent(ACTION_HANG_UP)))
+                .setStyle(NotificationCompat.CallStyle.forOngoingCall(peer, serviceIntent(ACTION_HANG_UP)).setIsVideo(video))
         }
             .setSmallIcon(R.drawable.ic_call)
             .setContentIntent(activityIntent(null))
@@ -52,9 +57,11 @@ class CallService : Service() {
             .build()
 
         // phoneCall is allowed from the background for calls registered with Telecom; the
-        // microphone type isn't, so it's only added once the user has answered (from the UI).
+        // microphone and camera types aren't, so they're only added once the user has answered
+        // (from the UI).
         var types = if (telecom) ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL else 0
         if (mode == Mode.ONGOING) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        if (mode == Mode.ONGOING && camera) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
         try {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, types)
         } catch (e: Exception) {
@@ -85,16 +92,20 @@ class CallService : Service() {
         private const val EXTRA_MODE = "mode"
         private const val EXTRA_TELECOM = "telecom"
         private const val EXTRA_PEER_NAME = "peer_name"
+        private const val EXTRA_CAMERA = "camera"
+        private const val EXTRA_VIDEO = "video"
         private const val NOTIFICATION_ID = 1
 
         /** Starts the service, or switches its notification to [mode]. */
-        fun update(context: Context, peerName: String, mode: Mode, telecom: Boolean) {
+        fun update(context: Context, peerName: String, mode: Mode, telecom: Boolean, camera: Boolean = false, video: Boolean = false) {
             ContextCompat.startForegroundService(
                 context,
                 Intent(context, CallService::class.java)
                     .putExtra(EXTRA_PEER_NAME, peerName)
                     .putExtra(EXTRA_MODE, mode.name)
-                    .putExtra(EXTRA_TELECOM, telecom),
+                    .putExtra(EXTRA_TELECOM, telecom)
+                    .putExtra(EXTRA_CAMERA, camera)
+                    .putExtra(EXTRA_VIDEO, video),
             )
         }
 

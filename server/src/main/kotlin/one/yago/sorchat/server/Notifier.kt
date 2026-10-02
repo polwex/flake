@@ -27,7 +27,7 @@ sealed interface Push {
     data object MessagesWaiting : Push
 
     /** Someone is calling; the app should ring and connect to get the call details. */
-    data class IncomingCall(val callId: String, val callerId: String, val callerName: String) : Push
+    data class IncomingCall(val callId: String, val callerId: String, val callerName: String, val video: Boolean) : Push
 
     /** The caller gave up before the call was picked up; stop ringing. */
     data class CallEnded(val callId: String) : Push
@@ -96,6 +96,7 @@ class FcmNotifier(private val store: Store, credentialsJson: String) : Notifier 
                             // Not "from": FCM reserves that key (and "google.*", "gcm.*", "message_type", ...).
                             put("callerId", push.callerId)
                             put("callerName", push.callerName)
+                            put("video", push.video.toString())
                         }
                         is Push.CallEnded -> {
                             put("type", "call_end")

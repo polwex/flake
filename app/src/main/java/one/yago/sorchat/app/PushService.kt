@@ -23,6 +23,7 @@ class PushService : FirebaseMessagingService() {
                 callId = data["callId"] ?: return,
                 from = data["callerId"] ?: return,
                 fromName = data["callerName"] ?: "Unknown",
+                video = data["video"] == "true",
             )
             "call_end" -> repository.calls.onCancelledPush(data["callId"] ?: return)
             else -> runBlocking { repository.syncFromPush() }

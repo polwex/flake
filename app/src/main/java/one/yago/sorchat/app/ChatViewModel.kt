@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.webrtc.EglBase
+import org.webrtc.VideoTrack
 
 data class UiState(
     val me: Identity? = null,
@@ -49,6 +51,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val player = VoicePlayer(viewModelScope)
     val playback: StateFlow<Playback?> = player.state
     val call: StateFlow<Call?> = repo.calls.call
+    val localVideo: StateFlow<VideoTrack?> = repo.calls.localVideo
+    val remoteVideo: StateFlow<VideoTrack?> = repo.calls.remoteVideo
+    val eglContext: EglBase.Context get() = repo.calls.eglBase.eglBaseContext
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private val conversation = local.map { it.openChat }.distinctUntilChanged()
@@ -132,10 +137,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.sendVoice(peer, file, durationMs) }
     }
 
-    fun startCall() {
+    fun startCall(video: Boolean) {
         val peer = state.value.contacts.firstOrNull { it.id == local.value.openChat } ?: return
         player.stop()
-        repo.calls.start(peer)
+        repo.calls.start(peer, video)
     }
 
     fun acceptCall() = repo.calls.accept()
@@ -143,6 +148,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun hangUp() = repo.calls.hangUp()
     fun setMuted(muted: Boolean) = repo.calls.setMuted(muted)
     fun setSpeaker(on: Boolean) = repo.calls.setSpeaker(on)
+    fun setCameraOn(on: Boolean) = repo.calls.setCameraOn(on)
+    fun switchCamera() = repo.calls.switchCamera()
 
     fun togglePlayback(message: ChatMessage) {
         try {

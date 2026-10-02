@@ -114,7 +114,7 @@ class Hub(private val store: Store, private val media: MediaStore, private val n
         val signal = frame.signal
         if (signal is CallSignal.Invite) {
             val callee = store.findUser(frame.to)
-            if (callee == null || !notifier.push(callee.id, Push.IncomingCall(frame.callId, user.id, user.name))) {
+            if (callee == null || !notifier.push(callee.id, Push.IncomingCall(frame.callId, user.id, user.name, signal.video))) {
                 session.sendFrame(ServerFrame.Call(frame.to, callee?.name ?: frame.to, frame.callId, CallSignal.End(EndReason.UNAVAILABLE)))
                 return
             }

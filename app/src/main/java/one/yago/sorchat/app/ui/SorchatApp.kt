@@ -25,6 +25,8 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
     val playback by vm.playback.collectAsStateWithLifecycle()
     val call by vm.call.collectAsStateWithLifecycle()
+    val localVideo by vm.localVideo.collectAsStateWithLifecycle()
+    val remoteVideo by vm.remoteVideo.collectAsStateWithLifecycle()
     if (state.me != null) RequestNotificationPermission()
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         val me = state.me
@@ -33,6 +35,9 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
         when {
             currentCall != null -> CallScreen(
                 call = currentCall,
+                video = CallVideo(vm.eglContext, localVideo, remoteVideo),
+                onCameraOn = vm::setCameraOn,
+                onSwitchCamera = vm::switchCamera,
                 onAccept = vm::acceptCall,
                 onDecline = vm::declineCall,
                 onHangUp = vm::hangUp,

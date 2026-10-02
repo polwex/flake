@@ -1,6 +1,8 @@
 package one.yago.sorchat.app
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.Ringtone
@@ -13,6 +15,7 @@ import androidx.core.telecom.CallAttributesCompat
 import androidx.core.telecom.CallControlScope
 import androidx.core.telecom.CallEndpointCompat
 import androidx.core.telecom.CallsManager
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,15 +33,26 @@ import one.yago.sorchat.protocol.CallSignal
 import one.yago.sorchat.protocol.EndReason
 import one.yago.sorchat.protocol.IceServer
 import one.yago.sorchat.protocol.ServerFrame
+import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
+import org.webrtc.Camera2Enumerator
+import org.webrtc.CameraVideoCapturer
+import org.webrtc.DefaultVideoDecoderFactory
+import org.webrtc.DefaultVideoEncoderFactory
+import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
+import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
+import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
+import org.webrtc.SurfaceTextureHelper
+import org.webrtc.VideoSource
+import org.webrtc.VideoTrack
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.util.UUID
 import kotlin.coroutines.resume
@@ -51,6 +65,9 @@ data class Call(
     val id: String,
     val peer: Contact,
     val phase: CallPhase,
+    val video: Boolean = false,
+    /** Video calls: whether we're sending our camera. */
+    val cameraOn: Boolean = false,
     /** When media started flowing, for the call timer. */
     val connectedAt: Long? = null,
     val endReason: EndReason? = null,
@@ -61,7 +78,7 @@ data class Call(
 )
 
 /**
- * 1:1 audio calls over WebRTC. Signaling goes through the chat WebSocket via [sendSignal].
+ * 1:1 audio and video calls over WebRTC. Signaling goes through the chat WebSocket via [sendSignal].
  * Calls are registered with Android's Telecom framework (core-telecom), which lets them ring
  * and run from the background, handles audio routing, and integrates with headsets and
  * cellular calls. All state changes run on one sequential dispatcher, so WebRTC and Telecom
@@ -83,6 +100,19 @@ class CallManager(
 
     private var peerConnection: PeerConnection? = null
     private var audioTrack: AudioTrack? = null
+    private var audioSource: AudioSource? = null
+    private var camera: CameraVideoCapturer? = null
+    private var cameraHelper: SurfaceTextureHelper? = null
+    private var videoSource: VideoSource? = null
+
+    private val _localVideo = MutableStateFlow<VideoTrack?>(null)
+    /** Our camera, for the self-view. */
+    val localVideo: StateFlow<VideoTrack?> = _localVideo.asStateFlow()
+    private val _remoteVideo = MutableStateFlow<VideoTrack?>(null)
+    val remoteVideo: StateFlow<VideoTrack?> = _remoteVideo.asStateFlow()
+
+    /** Shared GL context for the camera, the hardware codecs and the UI's video renderers. */
+    val eglBase: EglBase by lazy { EglBase.create() }
     /** The caller's offer. For a call announced by push, it arrives once the WebSocket connects. */
     private var offer = CompletableDeferred<String>()
     /** Candidates that arrived before the remote description was set. */
@@ -93,7 +123,9 @@ class CallManager(
 
     /** Null if this device doesn't support Telecom; calls then work only while the app is open. */
     private val telecom: CallsManager? = try {
-        CallsManager(context).also { it.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE) }
+        CallsManager(context).also {
+            it.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE or CallsManager.CAPABILITY_SUPPORTS_VIDEO_CALLING)
+        }
     } catch (e: Exception) {
         Log.w(TAG, "Telecom unavailable", e)
         null
@@ -113,23 +145,27 @@ class CallManager(
             .setUseHardwareAcousticEchoCanceler(true)
             .setUseHardwareNoiseSuppressor(true)
             .createAudioDeviceModule()
-        PeerConnectionFactory.builder().setAudioDeviceModule(audioDevice).createPeerConnectionFactory()
+        PeerConnectionFactory.builder()
+            .setAudioDeviceModule(audioDevice)
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
+            .createPeerConnectionFactory()
     }
 
     /** Whether a call is in progress (anything but idle or the brief "ended" display). */
     val inCall: Boolean get() = _call.value.let { it != null && it.phase != CallPhase.ENDED }
 
-    fun start(peer: Contact) = scope.launch {
+    fun start(peer: Contact, video: Boolean) = scope.launch {
         if (inCall) return@launch
         resetConnectionState()
-        val call = Call(UUID.randomUUID().toString(), peer, CallPhase.OUTGOING)
+        val call = Call(UUID.randomUUID().toString(), peer, CallPhase.OUTGOING, video = video, cameraOn = video)
         _call.value = call
         register(call, incoming = false)
         try {
             val pc = createPeerConnection(call)
             val sdp = pc.awaitCreate(offer = true)
             pc.awaitSetLocal(sdp)
-            send(CallSignal.Invite(sdp.description))
+            send(CallSignal.Invite(sdp.description, video = call.video))
             timeout = scope.launch {
                 delay(RING_TIMEOUT)
                 if (_call.value?.let { it.id == call.id && it.phase == CallPhase.OUTGOING } == true) {
@@ -145,9 +181,9 @@ class CallManager(
     }
 
     /** A push announced an incoming call: start ringing right away; the offer follows over the WebSocket. */
-    fun onIncomingPush(callId: String, from: String, fromName: String) = scope.launch {
+    fun onIncomingPush(callId: String, from: String, fromName: String, video: Boolean) = scope.launch {
         if (inCall) return@launch // busy: answered as such when the invite itself arrives
-        ring(Call(callId, Contact(from, fromName), CallPhase.INCOMING))
+        ring(Call(callId, Contact(from, fromName), CallPhase.INCOMING, video = video))
     }
 
     /** A push said the caller gave up before we connected. */
@@ -157,11 +193,13 @@ class CallManager(
     }
 
     fun accept() = scope.launch {
-        val call = _call.value?.takeIf { it.phase == CallPhase.INCOMING } ?: return@launch
+        val incoming = _call.value?.takeIf { it.phase == CallPhase.INCOMING } ?: return@launch
         stopRinging()
-        _call.value = call.copy(phase = CallPhase.CONNECTING)
-        control?.answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
-        CallService.update(context, call.peer.name, CallService.Mode.ONGOING, telecom = control != null)
+        // Without the camera permission we still see the caller, just don't send video back.
+        val call = incoming.copy(phase = CallPhase.CONNECTING, cameraOn = incoming.video && hasCameraPermission())
+        _call.value = call
+        control?.answer(if (call.video) CallAttributesCompat.CALL_TYPE_VIDEO_CALL else CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
+        CallService.update(context, call.peer.name, CallService.Mode.ONGOING, telecom = control != null, camera = call.cameraOn, video = call.video)
         try {
             val sdp = withTimeoutOrNull(OFFER_TIMEOUT) { offer.await() } ?: error("The call details never arrived")
             val pc = createPeerConnection(call)
@@ -193,6 +231,17 @@ class CallManager(
         audioTrack?.setEnabled(!muted)
         _call.update { it?.copy(muted = muted) }
     }
+
+    fun setCameraOn(on: Boolean) = scope.launch {
+        val current = _call.value ?: return@launch
+        val camera = camera ?: return@launch
+        _localVideo.value?.setEnabled(on)
+        // Stopping capture (not just disabling the track) also turns the camera itself off.
+        if (on) camera.startCapture(CAPTURE_WIDTH, CAPTURE_HEIGHT, CAPTURE_FPS) else camera.stopCapture()
+        _call.value = current.copy(cameraOn = on)
+    }
+
+    fun switchCamera() = scope.launch { camera?.switchCamera(null) }
 
     fun setSpeaker(on: Boolean) = scope.launch {
         val control = control
@@ -236,7 +285,7 @@ class CallManager(
                     sendSignal(frame.from, frame.callId, CallSignal.End(EndReason.BUSY))
                     return@launch
                 }
-                ring(Call(frame.callId, Contact(frame.from, frame.fromName), CallPhase.INCOMING))
+                ring(Call(frame.callId, Contact(frame.from, frame.fromName), CallPhase.INCOMING, video = signal.video))
                 offer.complete(signal.sdp)
             }
             else -> {
@@ -281,8 +330,9 @@ class CallManager(
     private fun register(call: Call, incoming: Boolean) {
         val telecom = telecom
         val mode = if (incoming) CallService.Mode.INCOMING else CallService.Mode.ONGOING
+        val camera = !incoming && call.cameraOn
         if (telecom == null) {
-            CallService.update(context, call.peer.name, mode, telecom = false)
+            CallService.update(context, call.peer.name, mode, telecom = false, camera = camera, video = call.video)
             return
         }
         scope.launch {
@@ -292,7 +342,7 @@ class CallManager(
                         displayName = call.peer.name,
                         address = Uri.fromParts("sorchat", call.peer.id, null),
                         direction = if (incoming) CallAttributesCompat.DIRECTION_INCOMING else CallAttributesCompat.DIRECTION_OUTGOING,
-                        callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL,
+                        callType = if (call.video) CallAttributesCompat.CALL_TYPE_VIDEO_CALL else CallAttributesCompat.CALL_TYPE_AUDIO_CALL,
                     ),
                     // Answered or ended from outside the app: a headset button, a watch, a cellular call.
                     onAnswer = { accept() },
@@ -307,7 +357,7 @@ class CallManager(
                             return@launch
                         }
                         control = this@addCall
-                        CallService.update(context, call.peer.name, mode, telecom = true)
+                        CallService.update(context, call.peer.name, mode, telecom = true, camera = camera, video = call.video)
                     }
                     launch { availableEndpoints.collect { endpoints = it } }
                     launch {
@@ -318,7 +368,9 @@ class CallManager(
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Telecom didn't accept the call", e)
-                if (_call.value?.id == call.id && inCall) CallService.update(context, call.peer.name, mode, telecom = false)
+                if (_call.value?.id == call.id && inCall) {
+                    CallService.update(context, call.peer.name, mode, telecom = false, camera = camera, video = call.video)
+                }
             }
         }
     }
@@ -337,14 +389,69 @@ class CallManager(
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
         }
         val pc = checkNotNull(factory.createPeerConnection(config, Observer(call.id))) { "Couldn't create PeerConnection" }
-        val track = factory.createAudioTrack("audio0", factory.createAudioSource(MediaConstraints()))
+        val source = factory.createAudioSource(MediaConstraints())
+        val track = factory.createAudioTrack("audio0", source)
         pc.addTrack(track, listOf("call"))
         peerConnection = pc
+        audioSource = source
         audioTrack = track
+        if (call.video) {
+            val videoTrack = if (call.cameraOn) startCamera() else null
+            if (videoTrack != null) {
+                pc.addTrack(videoTrack, listOf("call"))
+            } else {
+                // Still receive the other side's video.
+                pc.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY))
+                _call.update { it?.copy(cameraOn = false) }
+            }
+        }
         // With Telecom, the system sets up call audio itself.
         if (telecom == null) audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         return pc
     }
+
+    /** Opens the front camera (or whichever exists). Returns null if there's none or it fails. */
+    private fun startCamera(): VideoTrack? = try {
+        val enumerator = Camera2Enumerator(context)
+        val device = enumerator.deviceNames.firstOrNull(enumerator::isFrontFacing) ?: enumerator.deviceNames.firstOrNull()
+        val capturer = device?.let { enumerator.createCapturer(it, null) } ?: error("No camera")
+        val helper = SurfaceTextureHelper.create("camera", eglBase.eglBaseContext)
+        val source = factory.createVideoSource(false)
+        capturer.initialize(helper, context, source.capturerObserver)
+        capturer.startCapture(CAPTURE_WIDTH, CAPTURE_HEIGHT, CAPTURE_FPS)
+        camera = capturer
+        cameraHelper = helper
+        videoSource = source
+        factory.createVideoTrack("video0", source).also { _localVideo.value = it }
+    } catch (e: Exception) {
+        Log.w(TAG, "Couldn't open the camera", e)
+        null
+    }
+
+    private fun stopMedia() {
+        val localVideo = _localVideo.value
+        // Clearing these first makes the UI detach its renderers before the tracks go away.
+        _localVideo.value = null
+        _remoteVideo.value = null
+        camera?.let {
+            runCatching { it.stopCapture() }
+            it.dispose()
+        }
+        peerConnection?.dispose()
+        // Tracks and sources passed to addTrack aren't owned (or disposed) by the PeerConnection.
+        runCatching { audioTrack?.dispose() }
+        runCatching { localVideo?.dispose() }
+        runCatching { audioSource?.dispose() }
+        runCatching { videoSource?.dispose() }
+        cameraHelper?.dispose()
+        camera = null
+        cameraHelper = null
+        videoSource = null
+        audioSource = null
+    }
+
+    private fun hasCameraPermission() =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
     private fun onRemoteDescriptionSet(pc: PeerConnection) {
         remoteDescriptionSet = true
@@ -361,7 +468,7 @@ class CallManager(
         val call = _call.value ?: return
         timeout?.cancel()
         stopRinging()
-        peerConnection?.dispose()
+        stopMedia()
         resetConnectionState()
         if (telecom == null) {
             audioManager.mode = AudioManager.MODE_NORMAL
@@ -436,6 +543,8 @@ class CallManager(
                             _call.value = call.copy(phase = CallPhase.ACTIVE, connectedAt = System.currentTimeMillis())
                             control?.let { c -> c.launch { c.setActive() } }
                             logSelectedPair()
+                            // Video calls are held at arm's length.
+                            if (call.video) setSpeaker(true)
                         }
                     PeerConnection.PeerConnectionState.FAILED -> {
                         send(CallSignal.End(EndReason.FAILED))
@@ -461,13 +570,19 @@ class CallManager(
         override fun onRemoveStream(stream: MediaStream) = Unit
         override fun onDataChannel(channel: org.webrtc.DataChannel) = Unit
         override fun onRenegotiationNeeded() = Unit
-        override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) = Unit
+        override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {
+            val track = receiver.track() as? VideoTrack ?: return
+            scope.launch { if (_call.value?.id == callId) _remoteVideo.value = track }
+        }
     }
 
     private companion object {
         const val TAG = "CallManager"
         val RING_TIMEOUT = 45.seconds
         val OFFER_TIMEOUT = 15.seconds
+        const val CAPTURE_WIDTH = 1280
+        const val CAPTURE_HEIGHT = 720
+        const val CAPTURE_FPS = 30
         /** Audio routes when the speaker is off, most preferred first. */
         val PRIVATE_ROUTES = listOf(
             CallEndpointCompat.TYPE_BLUETOOTH,

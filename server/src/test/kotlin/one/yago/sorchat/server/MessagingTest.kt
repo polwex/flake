@@ -234,7 +234,7 @@ class MessagingTest {
                 bobWs.send(ClientFrame.Call(alice.userId, "c1", CallSignal.Accept("answer-sdp")))
                 assertEquals(ServerFrame.Call(bob.userId, "Bob", "c1", CallSignal.Accept("answer-sdp")), aliceWs.receiveFrame())
             }
-            assertEquals(listOf<Pair<String, Push>>(bob.userId to Push.IncomingCall("c1", alice.userId, "Alice")), pushes)
+            assertEquals(listOf<Pair<String, Push>>(bob.userId to Push.IncomingCall("c1", alice.userId, "Alice", video = false)), pushes)
 
             // A call the caller gives up on before the callee connects: the callee is told to stop ringing.
             aliceWs.send(ClientFrame.Call(bob.userId, "c2", CallSignal.Invite("offer-sdp")))

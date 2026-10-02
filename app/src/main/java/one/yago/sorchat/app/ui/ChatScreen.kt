@@ -79,7 +79,7 @@ fun ChatScreen(
     error: String?,
     onDismissError: () -> Unit,
     onSend: (String) -> Unit,
-    onCall: () -> Unit,
+    onCall: (video: Boolean) -> Unit,
     onBack: () -> Unit,
     onVisible: (String?) -> Unit,
     voice: VoiceControls,
@@ -101,8 +101,10 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    val call = withMicPermission(onCall)
-                    IconButton(onClick = call) { Icon(painterResource(R.drawable.ic_call), contentDescription = "Call") }
+                    val audioCall = withMicPermission { onCall(false) }
+                    val videoCall = withCallPermissions(video = true) { onCall(true) }
+                    IconButton(onClick = audioCall) { Icon(painterResource(R.drawable.ic_call), contentDescription = "Call") }
+                    IconButton(onClick = videoCall) { Icon(painterResource(R.drawable.ic_videocam), contentDescription = "Video call") }
                     ConnectionIndicator(connected, Modifier.padding(end = 16.dp))
                 },
             )
@@ -172,14 +174,22 @@ private fun InputRow(draft: String, onDraftChange: (String) -> Unit, onSend: () 
 
 /** Wraps [action] so it first asks for the microphone permission if needed. */
 @Composable
-fun withMicPermission(action: () -> Unit): () -> Unit {
+fun withMicPermission(action: () -> Unit): () -> Unit = withCallPermissions(video = false, action)
+
+/**
+ * Wraps [action] so it first asks for the microphone (and for video, camera) permission if
+ * needed. Only the microphone is required: without the camera, a video call just doesn't send video.
+ */
+@Composable
+fun withCallPermissions(video: Boolean, action: () -> Unit): () -> Unit {
     val context = LocalContext.current
-    val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) action()
+    val permissions = if (video) arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA) else arrayOf(Manifest.permission.RECORD_AUDIO)
+    val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted[Manifest.permission.RECORD_AUDIO] == true) action()
     }
     return {
-        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        if (granted) action() else request.launch(Manifest.permission.RECORD_AUDIO)
+        val missing = permissions.filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) action() else request.launch(missing.toTypedArray())
     }
 }
 
