@@ -34,7 +34,7 @@
     mkdir -p "$dest"
     chmod 700 "$dest"
     sqlite3 /var/lib/private/sorchat/sorchat.db ".backup '$dest/sorchat.db'"
-    if [ -d /var/lib/private/sorchat/media ]; then
+    if ${lib.boolToString cfg.backup.includeMedia} && [ -d /var/lib/private/sorchat/media ]; then
       cp -a --reflink=auto /var/lib/private/sorchat/media "$dest/"
     fi
   '';
@@ -65,6 +65,29 @@ in {
       type = types.nullOr types.path;
       default = null;
       description = "Firebase service-account JSON for push notifications. Without it, pushes are only logged.";
+    };
+
+    media = {
+      maxFileSize = mkOption {
+        type = types.ints.positive;
+        default = 25;
+        description = "Largest file (photo, document, voice note) that can be sent, in MB.";
+      };
+
+      quota = mkOption {
+        type = types.ints.positive;
+        default = 1024;
+        description = ''
+          Total MB of files waiting on the server to be downloaded. Files are deleted once the
+          recipient has them, so this only fills up when people stay offline for long.
+        '';
+      };
+
+      ttlDays = mkOption {
+        type = types.ints.positive;
+        default = 14;
+        description = "Files nobody downloaded are deleted after this many days.";
+      };
     };
 
     passkeys = {
@@ -108,6 +131,16 @@ in {
         type = types.ints.positive;
         default = 14;
         description = "Local backups older than this many days are deleted.";
+      };
+
+      includeMedia = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Also back up files waiting to be downloaded. They're short-lived (deleted once
+          downloaded), so by default only the database is backed up; a restore then only loses
+          files nobody had fetched yet.
+        '';
       };
 
       offsite = {
@@ -228,6 +261,9 @@ in {
           PORT = toString cfg.port;
           SORCHAT_DB = "/var/lib/sorchat/sorchat.db";
           SORCHAT_MEDIA_DIR = "/var/lib/sorchat/media";
+          SORCHAT_MAX_FILE_MB = toString cfg.media.maxFileSize;
+          SORCHAT_MEDIA_QUOTA_MB = toString cfg.media.quota;
+          SORCHAT_MEDIA_TTL_DAYS = toString cfg.media.ttlDays;
         }
         # %d is the directory where systemd puts the LoadCredential files below.
         // lib.optionalAttrs (cfg.fcmCredentialsFile != null) {
@@ -282,8 +318,8 @@ in {
         # The app's live connection is a WebSocket.
         proxyWebsockets = true;
         extraConfig = ''
-          # Voice notes up to 16 MB (nginx's default is 1 MB).
-          client_max_body_size 17m;
+          # Uploads up to the file size limit (nginx's default is 1 MB).
+          client_max_body_size ${toString (cfg.media.maxFileSize + 1)}m;
           # The WebSocket is pinged every 30 s; don't cut it off in between (default 60 s).
           proxy_read_timeout 120s;
         '';

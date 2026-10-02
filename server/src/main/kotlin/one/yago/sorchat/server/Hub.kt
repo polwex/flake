@@ -82,11 +82,16 @@ class Hub(private val store: Store, private val media: MediaStore, private val n
                         return
                     }
                     // Trust our own record of the upload over what the client claims.
-                    a.copy(mimeType = uploaded.mimeType, size = uploaded.size)
+                    a.copy(
+                        mimeType = uploaded.mimeType,
+                        size = uploaded.size,
+                        name = a.name?.substringAfterLast('/')?.substringAfterLast('\\')?.take(200)?.takeIf { it.isNotBlank() },
+                    )
                 }
                 val message = ServerFrame.Message(frame.id, user.id, user.name, frame.body, System.currentTimeMillis(), attachment)
                 when (store.storeMessage(message, recipient.id)) {
                     StoreResult.STORED -> {
+                        attachment?.let { store.setMediaRecipient(it.mediaId, recipient.id) }
                         session.sendFrame(ServerFrame.Accepted(frame.id))
                         deliver(recipient.id, message)
                     }
@@ -94,7 +99,8 @@ class Hub(private val store: Store, private val media: MediaStore, private val n
                     StoreResult.CONFLICT -> session.sendFrame(ServerFrame.Error(frame.id, "message id already in use"))
                 }
             }
-            is ClientFrame.Ack -> store.deleteMessage(frame.id, user.id)?.let { media.delete(it) }
+            // The attachment stays until the recipient has downloaded it (DELETE /media/{id}).
+            is ClientFrame.Ack -> store.deleteMessage(frame.id, user.id)
             is ClientFrame.Call -> relayCall(user, session, frame)
         }
     }

@@ -41,7 +41,11 @@ data class LoginResponse(val userId: String, val name: String, val token: String
 @Serializable
 data class UploadResponse(val mediaId: String)
 
-/** A file sent along with a message, uploaded beforehand through `POST /media`. */
+/**
+ * A file sent along with a message, uploaded beforehand through `POST /media`. The recipient
+ * downloads it with `GET /media/{id}` and then confirms with `DELETE /media/{id}`, which frees
+ * it on the server.
+ */
 @Serializable
 data class Attachment(
     val mediaId: String,
@@ -49,6 +53,11 @@ data class Attachment(
     val size: Long,
     /** For audio and video. */
     val durationMs: Long? = null,
+    /** Original file name, for files. */
+    val name: String? = null,
+    /** For images (and video): pixel size, so the chat can lay it out before it's downloaded. */
+    val width: Int? = null,
+    val height: Int? = null,
 )
 
 /** STUN/TURN servers for WebRTC, from `GET /ice-servers`. TURN credentials are short-lived. */

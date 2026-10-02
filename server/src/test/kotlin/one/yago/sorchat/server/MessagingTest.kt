@@ -7,6 +7,7 @@ import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.bearerAuth
+import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.put
@@ -135,7 +136,7 @@ class MessagingTest {
     }
 
     @Test
-    fun `voice note is uploaded, delivered with its message and deleted after ack`() = testApplication {
+    fun `a file is delivered with its message and deleted once the recipient has it`() = testApplication {
         val mediaDir = createTempDirectory().toFile()
         application { sorchat(Store.open(":memory:"), { _, _ -> true }, mediaDir) }
         val client = createClient {
@@ -154,7 +155,7 @@ class MessagingTest {
         client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
             assertEquals(ServerFrame.Synced, receiveFrame())
             // The client's claims about the file are replaced by the server's record.
-            send(ClientFrame.Send("v1", bob.userId, "", Attachment(upload.mediaId, "audio/fake", 1, durationMs = 1_200)))
+            send(ClientFrame.Send("v1", bob.userId, "", Attachment(upload.mediaId, "audio/fake", 1, durationMs = 1_200, name = "../../etc/notes.ogg")))
             assertEquals(ServerFrame.Accepted("v1"), receiveFrame())
             send(ClientFrame.Send("v2", bob.userId, "", Attachment("0".repeat(32), "audio/ogg", 1)))
             assertEquals(ServerFrame.Error("v2", "unknown attachment"), receiveFrame())
@@ -162,28 +163,43 @@ class MessagingTest {
 
         client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
             val attachment = (receiveFrame() as ServerFrame.Message).attachment!!
-            assertEquals(Attachment(upload.mediaId, "audio/ogg", audio.size.toLong(), 1_200), attachment)
-            val download = client.get("/media/${attachment.mediaId}") { bearerAuth(bob.token) }
-            assertEquals(ContentType.parse("audio/ogg"), download.contentType())
-            assertContentEquals(audio, download.readRawBytes())
-            send(ClientFrame.Ack("v1"))
+            // Path components are stripped from the name.
+            assertEquals(Attachment(upload.mediaId, "audio/ogg", audio.size.toLong(), 1_200, name = "notes.ogg"), attachment)
             assertEquals(ServerFrame.Synced, receiveFrame())
+            // The message is acked right away; the file is fetched afterwards (possibly much later).
+            send(ClientFrame.Ack("v1"))
         }
+
+        val charlie = client.register("Charlie")
+        assertEquals(HttpStatusCode.NotFound, client.get("/media/${upload.mediaId}") { bearerAuth(charlie.token) }.status)
+        assertEquals(HttpStatusCode.NotFound, client.delete("/media/${upload.mediaId}") { bearerAuth(alice.token) }.status)
+
+        val download = client.get("/media/${upload.mediaId}") { bearerAuth(bob.token) }
+        assertEquals(ContentType.parse("audio/ogg"), download.contentType())
+        assertContentEquals(audio, download.readRawBytes())
+        assertEquals(HttpStatusCode.NoContent, client.delete("/media/${upload.mediaId}") { bearerAuth(bob.token) }.status)
 
         assertEquals(HttpStatusCode.NotFound, client.get("/media/${upload.mediaId}") { bearerAuth(bob.token) }.status)
         assertEquals(emptyList(), mediaDir.list()!!.toList())
     }
 
     @Test
-    fun `uploads must be audio`() = testApplication {
-        application { sorchat(Store.open(":memory:"), { _, _ -> true }, createTempDirectory().toFile()) }
+    fun `uploads respect the file size limit and the storage quota`() = testApplication {
+        val limits = MediaLimits(maxFileBytes = 1_000, quotaBytes = 1_500)
+        application { sorchat(Store.open(":memory:"), { _, _ -> true }, createTempDirectory().toFile(), mediaLimits = limits) }
         val client = createClient { install(ContentNegotiation) { json(ProtocolJson) } }
         val alice = client.register("Alice")
-        val response = client.post("/media") {
-            bearerAuth(alice.token)
-            setBody(ByteArrayContent(ByteArray(10), ContentType.Application.Pdf))
-        }
-        assertEquals(HttpStatusCode.UnsupportedMediaType, response.status)
+        suspend fun upload(size: Int, type: ContentType = ContentType.Application.Pdf) =
+            client.post("/media") {
+                bearerAuth(alice.token)
+                setBody(ByteArrayContent(ByteArray(size), type))
+            }.status
+
+        assertEquals(HttpStatusCode.PayloadTooLarge, upload(1_200))
+        assertEquals(HttpStatusCode.OK, upload(800))
+        assertEquals(HttpStatusCode.OK, upload(500, ContentType.Image.JPEG))
+        // 1300 of 1500 bytes used: a 300-byte file no longer fits.
+        assertEquals(HttpStatusCode.InsufficientStorage, upload(300))
     }
 
     @Test

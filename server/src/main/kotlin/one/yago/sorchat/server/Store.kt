@@ -16,7 +16,7 @@ import java.util.Base64
 
 data class User(val id: String, val name: String)
 
-data class Media(val id: String, val owner: String, val mimeType: String, val size: Long)
+data class Media(val id: String, val owner: String, val mimeType: String, val size: Long, val recipient: String? = null)
 
 /** A registered passkey. Binary fields are base64url-encoded. */
 data class Passkey(val credentialId: String, val userId: String, val publicKeyCose: String, val signCount: Long)
@@ -172,19 +172,12 @@ class Store private constructor(private val conn: Connection) {
         }
     }
 
-    /** Deletes an acked message. Returns its attachment's media id, which is now unreferenced. */
-    suspend fun deleteMessage(id: String, recipient: String): String? = db {
-        val attachment = prepareStatement("SELECT attachment FROM messages WHERE id = ? AND recipient = ?").use {
-            it.setString(1, id)
-            it.setString(2, recipient)
-            it.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
-        }
+    suspend fun deleteMessage(id: String, recipient: String) = db {
         prepareStatement("DELETE FROM messages WHERE id = ? AND recipient = ?").use {
             it.setString(1, id)
             it.setString(2, recipient)
             it.executeUpdate()
         }
-        attachment?.let { ProtocolJson.decodeFromString(Attachment.serializer(), it).mediaId }
     }
 
     suspend fun deleteMessagesOlderThan(cutoff: Long) = db {
@@ -206,10 +199,26 @@ class Store private constructor(private val conn: Connection) {
     }
 
     suspend fun findMedia(id: String): Media? = db {
-        prepareStatement("SELECT id, owner, mime_type, size FROM media WHERE id = ?").use {
+        prepareStatement("SELECT id, owner, mime_type, size, recipient FROM media WHERE id = ?").use {
             it.setString(1, id)
-            it.executeQuery().use { rs -> if (rs.next()) Media(rs.getString(1), rs.getString(2), rs.getString(3), rs.getLong(4)) else null }
+            it.executeQuery().use { rs ->
+                if (rs.next()) Media(rs.getString(1), rs.getString(2), rs.getString(3), rs.getLong(4), rs.getString(5)) else null
+            }
         }
+    }
+
+    /** Records who the file was sent to: they may download (and then delete) it. */
+    suspend fun setMediaRecipient(id: String, recipient: String) = db {
+        prepareStatement("UPDATE media SET recipient = ? WHERE id = ?").use {
+            it.setString(1, recipient)
+            it.setString(2, id)
+            it.executeUpdate()
+        }
+    }
+
+    /** Total size of the files waiting on the server. */
+    suspend fun mediaBytes(): Long = db {
+        createStatement().use { it.executeQuery("SELECT COALESCE(SUM(size), 0) FROM media").use { rs -> rs.next(); rs.getLong(1) } }
     }
 
     suspend fun deleteMedia(id: String) = db {
@@ -246,6 +255,7 @@ class Store private constructor(private val conn: Connection) {
         private fun migrate(st: Statement) {
             if ("push_token" !in columns(st, "users")) st.execute("ALTER TABLE users ADD COLUMN push_token TEXT")
             if ("attachment" !in columns(st, "messages")) st.execute("ALTER TABLE messages ADD COLUMN attachment TEXT")
+            if ("recipient" !in columns(st, "media")) st.execute("ALTER TABLE media ADD COLUMN recipient TEXT")
         }
 
         fun open(path: String): Store {

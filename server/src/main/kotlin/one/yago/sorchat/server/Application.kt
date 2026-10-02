@@ -18,6 +18,7 @@ import io.ktor.server.request.receive
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
+import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.put
@@ -52,6 +53,11 @@ fun main() {
     val port = System.getenv("PORT")?.toInt() ?: 8080
     val dbPath = System.getenv("SORCHAT_DB") ?: "data/sorchat.db"
     val mediaDir = File(System.getenv("SORCHAT_MEDIA_DIR") ?: "data/media")
+    val mediaLimits = MediaLimits(
+        maxFileBytes = (System.getenv("SORCHAT_MAX_FILE_MB")?.toLong() ?: 25) * 1024 * 1024,
+        quotaBytes = (System.getenv("SORCHAT_MEDIA_QUOTA_MB")?.toLong() ?: 1024) * 1024 * 1024,
+        ttl = (System.getenv("SORCHAT_MEDIA_TTL_DAYS")?.toLong() ?: 14).days,
+    )
     val store = Store.open(dbPath)
     // Firebase service-account key, given as JSON content or as a file path; without it, pushes are only logged.
     val fcmCredentials = System.getenv("SORCHAT_FCM_CREDENTIALS_JSON")?.takeIf { it.isNotBlank() }
@@ -75,7 +81,8 @@ fun main() {
         log.info("Push notifications via {}", notifier::class.simpleName)
         log.info("ICE servers: {}", ice.describe())
         log.info("Passkeys: {}", passkeys?.let { "for ${it.rpId}, ${it.certFingerprints.size} app certificate(s)" } ?: "disabled")
-        sorchat(store, notifier, mediaDir, ice, passkeys)
+        log.info("Media: files up to {} MB, {} MB in total, kept {}", mediaLimits.maxFileBytes shr 20, mediaLimits.quotaBytes shr 20, mediaLimits.ttl)
+        sorchat(store, notifier, mediaDir, ice, passkeys, mediaLimits)
     }.start(wait = true)
 }
 
@@ -85,9 +92,10 @@ fun Application.sorchat(
     mediaDir: File,
     ice: IceConfig = IceConfig(),
     passkeyConfig: PasskeyConfig? = null,
+    mediaLimits: MediaLimits = MediaLimits(),
 ) {
     val passkeys = passkeyConfig?.let { Passkeys(store, it) }
-    val media = MediaStore(mediaDir, store)
+    val media = MediaStore(mediaDir, store, mediaLimits)
     val hub = Hub(store, media, notifier)
 
     install(ContentNegotiation) { json(ProtocolJson) }
@@ -104,7 +112,7 @@ fun Application.sorchat(
         while (true) {
             val cutoff = System.currentTimeMillis() - MESSAGE_TTL.inWholeMilliseconds
             store.deleteMessagesOlderThan(cutoff)
-            media.deleteOlderThan(cutoff)
+            media.deleteExpired()
             delay(1.hours)
         }
     }
@@ -141,24 +149,42 @@ fun Application.sorchat(
                 call.respond(HttpStatusCode.Unauthorized)
                 return@post
             }
-            val type = call.request.contentType().withoutParameters()
-            if (type.contentType != "audio") {
-                call.respond(HttpStatusCode.UnsupportedMediaType)
-                return@post
+            val type = call.request.contentType().takeIf { it != ContentType.Any }?.withoutParameters() ?: ContentType.Application.OctetStream
+            val declaredSize = call.request.headers["Content-Length"]?.toLongOrNull()
+            val result = call.receiveChannel().toInputStream().use { media.save(user.id, type.toString(), it, declaredSize) }
+            when (result) {
+                is SaveResult.Saved -> call.respond(UploadResponse(result.id))
+                SaveResult.TooLarge -> call.respond(HttpStatusCode.PayloadTooLarge, "Files can be up to ${media.limits.maxFileBytes shr 20} MB")
+                SaveResult.QuotaFull -> call.respond(HttpStatusCode.InsufficientStorage, "The server's storage is full, try again later")
             }
-            val id = call.receiveChannel().toInputStream().use { media.save(user.id, type.toString(), it) }
-            if (id == null) call.respond(HttpStatusCode.PayloadTooLarge)
-            else call.respond(UploadResponse(id))
         }
 
         get("/media/{id}") {
-            if (call.user() == null) {
+            val user = call.user()
+            if (user == null) {
                 call.respond(HttpStatusCode.Unauthorized)
                 return@get
             }
-            val found = media.find(call.parameters["id"]!!)
+            // Only the uploader and the recipient; to everyone else the file doesn't exist.
+            val found = media.find(call.parameters["id"]!!)?.takeIf { it.owner == user.id || it.recipient == user.id }
             if (found == null) call.respond(HttpStatusCode.NotFound)
             else call.respond(LocalFileContent(media.file(found), ContentType.parse(found.mimeType)))
+        }
+
+        // The recipient has the file: the server's copy can go.
+        delete("/media/{id}") {
+            val user = call.user()
+            if (user == null) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@delete
+            }
+            val found = media.find(call.parameters["id"]!!)?.takeIf { it.recipient == user.id }
+            if (found == null) {
+                call.respond(HttpStatusCode.NotFound)
+            } else {
+                media.delete(found.id)
+                call.respond(HttpStatusCode.NoContent)
+            }
         }
 
         // Digital Asset Links: lets the Android app use passkeys for this domain.
