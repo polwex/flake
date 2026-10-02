@@ -1,5 +1,6 @@
-# The sorchat chat server, built from source. Dependencies are pinned in deps.json; after
-# changing Gradle dependencies, regenerate it with:
+# The sorchat chat server, built from source. Dependencies are pinned in deps.json, which is
+# only valid for the Gradle version it was recorded with (the flake pins it via nixpkgs-gradle).
+# After changing Gradle dependencies or that pin, regenerate it with:
 #   nix build .#sorchat-server.mitmCache.updateScript && ./result
 {
   lib,
