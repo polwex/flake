@@ -21,6 +21,8 @@ captures/
 
 # Server data
 server/data/
+# A server started from the repo root keeps its data here by default
+/data/
 *.db
 bulk
 
