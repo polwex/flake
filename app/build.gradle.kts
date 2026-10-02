@@ -21,9 +21,9 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
-        // 10.0.2.2 is the host machine as seen from the emulator.
-        // Override with: ./gradlew :app:installDebug -Psorchat.serverUrl=https://chat.example.com
-        val serverUrl = providers.gradleProperty("sorchat.serverUrl").getOrElse("http://10.0.2.2:8080")
+        // For a local dev server: -Psorchat.serverUrl=http://10.0.2.2:8080 (the host as seen from the
+        // emulator) or http://localhost:8080 on a USB device after `adb reverse tcp:8080 tcp:8080`.
+        val serverUrl = providers.gradleProperty("sorchat.serverUrl").getOrElse("https://chat.urbit.men")
         buildConfigField("String", "SERVER_URL", "\"$serverUrl\"")
     }
 

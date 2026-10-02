@@ -94,6 +94,7 @@ class ChatRepository private constructor(private val context: Context) {
         val me = Identity(response.userId, name, response.token)
         prefs.identity = me
         prefs.registeredPushToken = null
+        notice.value = null
         _identity.value = me
         updateConnection()
     }
