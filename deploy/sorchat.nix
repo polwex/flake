@@ -1,14 +1,18 @@
 # NixOS module for the sorchat chat server, behind nginx, next to coturn.nix.
+# Exported by this repo's flake as nixosModules.default, with the server package built from source:
 #
-#   imports = [ ./sorchat.nix ];
-#   services.sorchat = {
-#     enable = true;
-#     package = pkgs.callPackage ./sorchat-server.nix { src = ./server.tar; };
-#     domain = "chat.urbit.men";
-#     fcmCredentialsFile = "/run/secrets/sorchat-fcm.json";
-#   };
+#   inputs.sorchat.url = "git+https://…/sorchat";
+#   modules = [
+#     sorchat.nixosModules.default
+#     {
+#       services.sorchat = {
+#         enable = true;
+#         domain = "chat.urbit.men";
+#         fcmCredentialsFile = "/run/secrets/sorchat-fcm.json";
+#       };
+#     }
+#   ];
 #
-# The package is built from `./gradlew :server:distTar` (server/build/distributions/server.tar).
 # Secrets only need to be readable by root: systemd hands them to the service as credentials.
 {
   config,
@@ -24,7 +28,7 @@ in {
 
     package = mkOption {
       type = types.package;
-      description = "The sorchat server package, see sorchat-server.nix.";
+      description = "The sorchat server package (nix/sorchat-server.nix; the flake's module sets it).";
     };
 
     domain = mkOption {

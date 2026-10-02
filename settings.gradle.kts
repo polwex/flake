@@ -16,4 +16,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "sorchat"
 
-include(":shared", ":server", ":app")
+include(":shared", ":server")
+// The Nix build of the server (-Psorchat.serverOnly=true) leaves out the app, so it doesn't need the Android SDK.
+if (providers.gradleProperty("sorchat.serverOnly").orNull != "true") include(":app")
