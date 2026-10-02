@@ -22,7 +22,9 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
+import java.util.concurrent.CopyOnWriteArrayList
 import one.yago.sorchat.protocol.Attachment
 import one.yago.sorchat.protocol.CallSignal
 import one.yago.sorchat.protocol.ClientFrame
@@ -37,6 +39,11 @@ import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+
+/** Waits (up to 5 s) for something the server does asynchronously. */
+private suspend fun eventually(condition: () -> Boolean) = withTimeout(5_000) {
+    while (!condition()) delay(20)
+}
 
 class MessagingTest {
     private fun ApplicationTestBuilder.setUp(pushed: MutableList<String>): HttpClient {
@@ -224,7 +231,8 @@ class MessagingTest {
 
     @Test
     fun `a call to an offline user pushes them and is held until they connect`() = testApplication {
-        val pushes = mutableListOf<Pair<String, Push>>()
+        // Written by the server's coroutines, read by the test.
+        val pushes = CopyOnWriteArrayList<Pair<String, Push>>()
         val store = Store.open(":memory:")
         application { sorchat(store, { userId, push -> pushes += userId to push; userId != "nobody" }, createTempDirectory().toFile()) }
         val client = createClient {
@@ -240,6 +248,11 @@ class MessagingTest {
             assertEquals(ServerFrame.Synced, aliceWs.receiveFrame())
             aliceWs.send(ClientFrame.Call(bob.userId, "c1", CallSignal.Invite("offer-sdp")))
             aliceWs.send(ClientFrame.Call(bob.userId, "c1", ice))
+            // The push is what wakes Bob's device, so it comes before he connects. (Sending a frame
+            // only queues it; without waiting, Bob could connect before the server even saw the invite.)
+            eventually { pushes.isNotEmpty() }
+            // The candidate is handled right after the invite; give it the same chance.
+            delay(200)
 
             // Bob's device wakes up and connects: it gets the invite and the candidate sent meanwhile.
             client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
@@ -255,6 +268,7 @@ class MessagingTest {
             // A call the caller gives up on before the callee connects: the callee is told to stop ringing.
             aliceWs.send(ClientFrame.Call(bob.userId, "c2", CallSignal.Invite("offer-sdp")))
             aliceWs.send(ClientFrame.Call(bob.userId, "c2", CallSignal.End(EndReason.HANGUP)))
+            eventually { pushes.lastOrNull()?.second == Push.CallEnded("c2") }
             client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
                 assertEquals(ServerFrame.Synced, receiveFrame())
             }
