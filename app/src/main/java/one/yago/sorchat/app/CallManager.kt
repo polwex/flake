@@ -250,6 +250,7 @@ class CallManager(
                         onRemoteDescriptionSet(pc)
                     }
                     is CallSignal.Ice -> {
+                        Log.d(TAG, "Remote candidate: ${describeCandidate(signal.candidate)}")
                         val candidate = IceCandidate(signal.sdpMid, signal.sdpMLineIndex, signal.candidate)
                         val pc = peerConnection
                         if (pc != null && remoteDescriptionSet) pc.addIceCandidate(candidate) else pendingIce += candidate
@@ -387,6 +388,18 @@ class CallManager(
         }
     }
 
+    /** Logs which candidate pair WebRTC settled on: direct (host/srflx) or through the relay. */
+    private fun logSelectedPair() {
+        peerConnection?.getStats { report ->
+            val stats = report.statsMap
+            val pair = stats.values.firstOrNull {
+                it.type == "candidate-pair" && it.members["nominated"] == true && it.members["state"] == "succeeded"
+            } ?: return@getStats
+            fun side(id: Any?) = stats[id]?.members?.let { "${it["candidateType"]}/${it["protocol"]} ${it["address"]}:${it["port"]}" }
+            Log.d(TAG, "Selected pair: local ${side(pair.members["localCandidateId"])} ⇄ remote ${side(pair.members["remoteCandidateId"])}")
+        }
+    }
+
     private fun resetConnectionState() {
         peerConnection = null
         audioTrack = null
@@ -408,6 +421,7 @@ class CallManager(
 
     private inner class Observer(private val callId: String) : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate) {
+            Log.d(TAG, "Local candidate: ${describeCandidate(candidate.sdp)}")
             scope.launch {
                 if (_call.value?.id == callId) send(CallSignal.Ice(candidate.sdpMid, candidate.sdpMLineIndex, candidate.sdp))
             }
@@ -421,6 +435,7 @@ class CallManager(
                         if (call.phase != CallPhase.ACTIVE) {
                             _call.value = call.copy(phase = CallPhase.ACTIVE, connectedAt = System.currentTimeMillis())
                             control?.let { c -> c.launch { c.setActive() } }
+                            logSelectedPair()
                         }
                     PeerConnection.PeerConnectionState.FAILED -> {
                         send(CallSignal.End(EndReason.FAILED))
@@ -432,9 +447,15 @@ class CallManager(
         }
 
         override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
-        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) = Unit
+        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
+            Log.d(TAG, "ICE connection: $state")
+        }
+
         override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) = Unit
+
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+            Log.d(TAG, "ICE gathering: $state")
+        }
         override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
         override fun onAddStream(stream: MediaStream) = Unit
         override fun onRemoveStream(stream: MediaStream) = Unit
@@ -454,6 +475,13 @@ class CallManager(
             CallEndpointCompat.TYPE_EARPIECE,
         )
     }
+}
+
+/** "relay udp 38.60.254.66:49201" from an SDP candidate line. */
+private fun describeCandidate(sdp: String): String {
+    val parts = sdp.split(" ")
+    val type = parts.getOrNull(parts.indexOf("typ") + 1) ?: "?"
+    return "$type ${parts.getOrNull(2)?.lowercase()} ${parts.getOrNull(4)}:${parts.getOrNull(5)}"
 }
 
 private suspend fun PeerConnection.awaitCreate(offer: Boolean): SessionDescription =
