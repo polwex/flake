@@ -23,6 +23,22 @@
   ...
 }: let
   cfg = config.services.sorchat;
+
+  # Copies the database (SQLite's online backup: consistent while the server keeps writing) and
+  # media into the directory given as $1. Shared by the local and offsite backups.
+  snapshot = pkgs.writeShellScript "sorchat-snapshot" ''
+    set -euo pipefail
+    export PATH=${lib.makeBinPath [pkgs.sqlite pkgs.coreutils]}
+    dest=$1
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    chmod 700 "$dest"
+    sqlite3 /var/lib/private/sorchat/sorchat.db ".backup '$dest/sorchat.db'"
+    if [ -d /var/lib/private/sorchat/media ]; then
+      cp -a --reflink=auto /var/lib/private/sorchat/media "$dest/"
+    fi
+  '';
+  offsiteStaging = "/var/backup/sorchat-offsite-staging";
   inherit (lib) mkEnableOption mkIf mkOption types;
 in {
   options.services.sorchat = {
@@ -76,8 +92,8 @@ in {
         type = types.path;
         default = "/var/backup/sorchat";
         description = ''
-          Where backups go, one timestamped directory each. Copy them off the machine too
-          (e.g. with services.restic or services.borgbackup) to survive losing the VPS.
+          Where local backups go, one timestamped directory each. These are for quick restores;
+          they don't survive losing the machine, which is what `backup.offsite` is for.
         '';
       };
 
@@ -91,7 +107,38 @@ in {
       keepDays = mkOption {
         type = types.ints.positive;
         default = 14;
-        description = "Backups older than this many days are deleted.";
+        description = "Local backups older than this many days are deleted.";
+      };
+
+      offsite = {
+        repository = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "s3:https://s3.eu-central-1.amazonaws.com/my-bucket/sorchat";
+          description = ''
+            restic repository to copy backups to, e.g. an S3-compatible bucket (AWS, Backblaze B2,
+            Cloudflare R2, Hetzner Object Storage, MinIO). Backups are encrypted before they leave
+            the machine. Null disables offsite backups.
+          '';
+        };
+
+        passwordFile = mkOption {
+          type = types.nullOr types.path;
+          default = null;
+          description = "File with restic's encryption password. Keep a copy elsewhere: without it the backups can't be read.";
+        };
+
+        environmentFile = mkOption {
+          type = types.nullOr types.path;
+          default = null;
+          description = "Credentials for the repository, e.g. AWS_ACCESS_KEY_ID=… and AWS_SECRET_ACCESS_KEY=… for S3.";
+        };
+
+        pruneOpts = mkOption {
+          type = types.listOf types.str;
+          default = ["--keep-daily 7" "--keep-weekly 4" "--keep-monthly 6"];
+          description = "Which snapshots restic keeps.";
+        };
       };
     };
 
@@ -113,21 +160,40 @@ in {
   };
 
   config = mkIf cfg.enable {
-    # Restore: stop sorchat, copy a backup's sorchat.db and media/ to /var/lib/private/sorchat/,
-    # start sorchat (systemd fixes the ownership).
+    assertions = [
+      {
+        assertion = cfg.backup.offsite.repository == null || cfg.backup.offsite.passwordFile != null;
+        message = "services.sorchat.backup.offsite needs a passwordFile to encrypt the backups with.";
+      }
+    ];
+
+    # Offsite (restic): `restic-sorchat snapshots` lists them, `restic-sorchat restore latest
+    # --target /tmp/restore` gets the newest back (the wrapper has the repository and keys set).
+    services.restic.backups.sorchat = mkIf (cfg.backup.offsite.repository != null) {
+      inherit (cfg.backup.offsite) repository passwordFile environmentFile pruneOpts;
+      initialize = true;
+      createWrapper = true;
+      paths = [offsiteStaging];
+      # A consistent snapshot first; restic then uploads only what changed since last time.
+      backupPrepareCommand = "${snapshot} ${offsiteStaging}";
+      backupCleanupCommand = "rm -rf ${offsiteStaging}";
+      timerConfig = {
+        OnCalendar = cfg.backup.schedule;
+        Persistent = true;
+        RandomizedDelaySec = "15m";
+      };
+    };
+
+    # Restore (local): stop sorchat, copy a backup's sorchat.db and media/ to
+    # /var/lib/private/sorchat/, start sorchat (systemd fixes the ownership).
     systemd.services.sorchat-backup = mkIf cfg.backup.enable {
       description = "Back up the sorchat database and media";
-      path = [pkgs.sqlite pkgs.coreutils pkgs.findutils];
+      path = [pkgs.coreutils pkgs.findutils];
       script = ''
         set -euo pipefail
         dest=${lib.escapeShellArg cfg.backup.directory}/$(date +%Y-%m-%d_%H%M%S)
-        mkdir -p "$dest"
-        # SQLite's online backup gives a consistent copy while the server keeps writing.
-        sqlite3 /var/lib/private/sorchat/sorchat.db ".backup '$dest/sorchat.db'"
-        if [ -d /var/lib/private/sorchat/media ]; then
-          cp -a --reflink=auto /var/lib/private/sorchat/media "$dest/"
-        fi
-        find ${lib.escapeShellArg cfg.backup.directory} -mindepth 1 -maxdepth 1 -type d \
+        ${snapshot} "$dest"
+        find ${lib.escapeShellArg cfg.backup.directory} -mindepth 1 -maxdepth 1 -type d -name '20*' \
           -mtime +${toString cfg.backup.keepDays} -exec rm -rf {} +
         echo "Backed up to $dest ($(du -sh "$dest" | cut -f1))"
       '';
