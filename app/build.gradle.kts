@@ -19,7 +19,7 @@ android {
         minSdk = 29
         targetSdk = 36
         versionCode = 2
-        versionName = "0.2.0"
+        versionName = "0.2.1"
 
         // For a local dev server: -Psorchat.serverUrl=http://10.0.2.2:8080 (the host as seen from the
         // emulator) or http://localhost:8080 on a USB device after `adb reverse tcp:8080 tcp:8080`.
