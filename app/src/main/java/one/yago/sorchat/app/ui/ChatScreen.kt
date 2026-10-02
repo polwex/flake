@@ -79,6 +79,7 @@ fun ChatScreen(
     error: String?,
     onDismissError: () -> Unit,
     onSend: (String) -> Unit,
+    onCall: () -> Unit,
     onBack: () -> Unit,
     onVisible: (String?) -> Unit,
     voice: VoiceControls,
@@ -99,7 +100,11 @@ fun ChatScreen(
                         Text(contact.id, style = MaterialTheme.typography.labelSmall)
                     }
                 },
-                actions = { ConnectionIndicator(connected, Modifier.padding(end = 16.dp)) },
+                actions = {
+                    val call = withMicPermission(onCall)
+                    IconButton(onClick = call) { Icon(painterResource(R.drawable.ic_call), contentDescription = "Call") }
+                    ConnectionIndicator(connected, Modifier.padding(end = 16.dp))
+                },
             )
         },
         bottomBar = {
@@ -146,10 +151,7 @@ fun ChatScreen(
 
 @Composable
 private fun InputRow(draft: String, onDraftChange: (String) -> Unit, onSend: () -> Unit, onRecord: () -> Unit) {
-    val context = LocalContext.current
-    val requestMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) onRecord()
-    }
+    val record = withMicPermission(onRecord)
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         OutlinedTextField(
             value = draft,
@@ -161,13 +163,23 @@ private fun InputRow(draft: String, onDraftChange: (String) -> Unit, onSend: () 
         if (draft.isNotBlank()) {
             TextButton(onClick = onSend) { Text("Send") }
         } else {
-            IconButton(onClick = {
-                val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-                if (granted) onRecord() else requestMic.launch(Manifest.permission.RECORD_AUDIO)
-            }) {
+            IconButton(onClick = record) {
                 Icon(painterResource(R.drawable.ic_mic), contentDescription = "Record voice message")
             }
         }
+    }
+}
+
+/** Wraps [action] so it first asks for the microphone permission if needed. */
+@Composable
+fun withMicPermission(action: () -> Unit): () -> Unit {
+    val context = LocalContext.current
+    val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) action()
+    }
+    return {
+        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (granted) action() else request.launch(Manifest.permission.RECORD_AUDIO)
     }
 }
 

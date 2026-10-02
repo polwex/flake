@@ -44,6 +44,13 @@ class ChatRepository private constructor(private val context: Context) {
     val identity: StateFlow<Identity?> = _identity.asStateFlow()
     val connected: StateFlow<Boolean> = client.connected
 
+    val calls = CallManager(
+        context,
+        scope,
+        sendSignal = { to, callId, signal -> client.send(ClientFrame.Call(to, callId, signal)) },
+        iceServers = { client.iceServers(checkNotNull(identity.value).token) },
+    )
+
     /** Something the user should be told about that happened outside the UI's control. */
     val notice = MutableStateFlow<String?>(null)
 
@@ -60,6 +67,11 @@ class ChatRepository private constructor(private val context: Context) {
             value?.let(notifications::cancel)
         }
 
+    init {
+        // Calls need the signaling connection even if the app goes to the background mid-call.
+        scope.launch { calls.call.collect { updateConnection() } }
+    }
+
     @Synchronized
     fun setForeground(value: Boolean) {
         foreground = value
@@ -69,7 +81,7 @@ class ChatRepository private constructor(private val context: Context) {
     @Synchronized
     private fun updateConnection() {
         val me = identity.value
-        if (foreground && me != null) {
+        if ((foreground || calls.inCall) && me != null) {
             if (live?.isActive != true) live = scope.launch { runLive(me) }
         } else {
             live?.cancel()
@@ -210,6 +222,7 @@ class ChatRepository private constructor(private val context: Context) {
                 }
             }
             is ServerFrame.Accepted -> dao.setStatus(frame.id, MessageStatus.SENT)
+            is ServerFrame.Call -> calls.onSignal(frame)
             is ServerFrame.Synced -> Unit
             is ServerFrame.Error -> {
                 val id = frame.id

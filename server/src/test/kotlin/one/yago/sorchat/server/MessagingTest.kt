@@ -23,7 +23,9 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
 import kotlinx.coroutines.withTimeout
 import one.yago.sorchat.protocol.Attachment
+import one.yago.sorchat.protocol.CallSignal
 import one.yago.sorchat.protocol.ClientFrame
+import one.yago.sorchat.protocol.EndReason
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
@@ -182,5 +184,40 @@ class MessagingTest {
             setBody(ByteArrayContent(ByteArray(10), ContentType.Application.Pdf))
         }
         assertEquals(HttpStatusCode.UnsupportedMediaType, response.status)
+    }
+
+    @Test
+    fun `call signals are relayed between connected users only`() = testApplication {
+        val client = setUp(mutableListOf())
+        val alice = client.register("Alice")
+        val bob = client.register("Bob")
+
+        client.webSocket("/ws", request = { bearerAuth(alice.token) }) {
+            val aliceWs = this
+            assertEquals(ServerFrame.Synced, aliceWs.receiveFrame())
+            // Bob is offline: the invite bounces back as unavailable.
+            aliceWs.send(ClientFrame.Call(bob.userId, "c1", CallSignal.Invite("offer-sdp")))
+            assertEquals(ServerFrame.Call(bob.userId, "Bob", "c1", CallSignal.End(EndReason.UNAVAILABLE)), aliceWs.receiveFrame())
+
+            client.webSocket("/ws", request = { bearerAuth(bob.token) }) {
+                val bobWs = this
+                assertEquals(ServerFrame.Synced, bobWs.receiveFrame())
+                aliceWs.send(ClientFrame.Call(bob.userId, "c2", CallSignal.Invite("offer-sdp")))
+                assertEquals(ServerFrame.Call(alice.userId, "Alice", "c2", CallSignal.Invite("offer-sdp")), bobWs.receiveFrame())
+                bobWs.send(ClientFrame.Call(alice.userId, "c2", CallSignal.Accept("answer-sdp")))
+                assertEquals(ServerFrame.Call(bob.userId, "Bob", "c2", CallSignal.Accept("answer-sdp")), aliceWs.receiveFrame())
+            }
+        }
+    }
+
+    @Test
+    fun `TURN credentials follow coturn's shared-secret scheme`() {
+        val ice = IceConfig(listOf("turn:turn.example.com:3478"), secret = "s3cret", now = { 1_000_000_000_000 })
+        val server = ice.serversFor("alice").single()
+        // expiry = now + 24h, in seconds
+        assertEquals("1000086400:alice", server.username)
+        val mac = javax.crypto.Mac.getInstance("HmacSHA1").apply { init(javax.crypto.spec.SecretKeySpec("s3cret".toByteArray(), "HmacSHA1")) }
+        assertEquals(java.util.Base64.getEncoder().encodeToString(mac.doFinal("1000086400:alice".toByteArray())), server.credential)
+        assertEquals(listOf("stun:stun.l.google.com:19302"), IceConfig().serversFor("alice").single().urls)
     }
 }

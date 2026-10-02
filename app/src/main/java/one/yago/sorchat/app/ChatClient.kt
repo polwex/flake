@@ -33,6 +33,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import one.yago.sorchat.protocol.ClientFrame
+import one.yago.sorchat.protocol.IceServer
+import one.yago.sorchat.protocol.IceServersResponse
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
@@ -87,6 +89,9 @@ class ChatClient(private val baseUrl: String) {
             setBody(PushTokenRequest(pushToken))
         }
     }
+
+    suspend fun iceServers(token: String): List<IceServer> =
+        http.get("$baseUrl/ice-servers") { bearerAuth(token) }.body<IceServersResponse>().servers
 
     /** Uploads a file for use as an attachment. Returns its media id. */
     suspend fun upload(token: String, file: File, mimeType: String): String {

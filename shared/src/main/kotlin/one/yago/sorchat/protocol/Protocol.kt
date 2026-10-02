@@ -36,6 +36,45 @@ data class Attachment(
     val durationMs: Long? = null,
 )
 
+/** STUN/TURN servers for WebRTC, from `GET /ice-servers`. TURN credentials are short-lived. */
+@Serializable
+data class IceServer(val urls: List<String>, val username: String? = null, val credential: String? = null)
+
+@Serializable
+data class IceServersResponse(val servers: List<IceServer>)
+
+/** WebRTC call setup, relayed between two connected users. Never stored by the server. */
+@Serializable
+sealed interface CallSignal {
+    /** Starts a call. [sdp] is the caller's offer. */
+    @Serializable
+    @SerialName("invite")
+    data class Invite(val sdp: String, val video: Boolean = false) : CallSignal
+
+    /** The callee picked up. [sdp] is their answer. */
+    @Serializable
+    @SerialName("accept")
+    data class Accept(val sdp: String) : CallSignal
+
+    @Serializable
+    @SerialName("ice")
+    data class Ice(val sdpMid: String?, val sdpMLineIndex: Int, val candidate: String) : CallSignal
+
+    @Serializable
+    @SerialName("end")
+    data class End(val reason: EndReason) : CallSignal
+}
+
+@Serializable
+enum class EndReason {
+    @SerialName("hangup") HANGUP,
+    @SerialName("declined") DECLINED,
+    @SerialName("busy") BUSY,
+    /** The callee isn't connected. */
+    @SerialName("unavailable") UNAVAILABLE,
+    @SerialName("failed") FAILED,
+}
+
 /** Registers the device's FCM token so the server can wake it when messages are waiting. */
 @Serializable
 data class PushTokenRequest(val token: String)
@@ -57,6 +96,11 @@ sealed interface ClientFrame {
         val body: String,
         val attachment: Attachment? = null,
     ) : ClientFrame
+
+    /** A call signal for [to], forwarded only if they're connected. */
+    @Serializable
+    @SerialName("call")
+    data class Call(val to: String, val callId: String, val signal: CallSignal) : ClientFrame
 
     /** Confirms receipt of a message; the server then deletes it from its queue. */
     @Serializable
@@ -83,6 +127,10 @@ sealed interface ServerFrame {
         val sentAt: Long,
         val attachment: Attachment? = null,
     ) : ServerFrame
+
+    @Serializable
+    @SerialName("call")
+    data class Call(val from: String, val fromName: String, val callId: String, val signal: CallSignal) : ServerFrame
 
     /** All messages queued while the client was offline have been sent. */
     @Serializable

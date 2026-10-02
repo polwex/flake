@@ -34,6 +34,7 @@ import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import one.yago.sorchat.protocol.IceServersResponse
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.PushTokenRequest
 import one.yago.sorchat.protocol.RegisterRequest
@@ -52,13 +53,20 @@ fun main() {
     val fcmCredentials = System.getenv("SORCHAT_FCM_CREDENTIALS_JSON")?.takeIf { it.isNotBlank() }
         ?: System.getenv("SORCHAT_FCM_CREDENTIALS")?.takeIf { it.isNotBlank() }?.let { File(it).readText() }
     val notifier = fcmCredentials?.let { FcmNotifier(store, it) } ?: LogNotifier()
+    // coturn, e.g. SORCHAT_TURN_URLS="stun:turn.example.com:3478,turn:turn.example.com:3478,turns:turn.example.com:5349"
+    // with SORCHAT_TURN_SECRET matching its static-auth-secret. Without it, only a public STUN server is offered.
+    val ice = IceConfig(
+        urls = System.getenv("SORCHAT_TURN_URLS")?.split(",")?.map(String::trim)?.filter(String::isNotEmpty).orEmpty(),
+        secret = System.getenv("SORCHAT_TURN_SECRET")?.takeIf { it.isNotBlank() },
+    )
     embeddedServer(Netty, port = port, host = "0.0.0.0") {
         log.info("Push notifications via {}", notifier::class.simpleName)
-        sorchat(store, notifier, mediaDir)
+        log.info("ICE servers: {}", ice.describe())
+        sorchat(store, notifier, mediaDir, ice)
     }.start(wait = true)
 }
 
-fun Application.sorchat(store: Store, notifier: Notifier, mediaDir: File) {
+fun Application.sorchat(store: Store, notifier: Notifier, mediaDir: File, ice: IceConfig = IceConfig()) {
     val media = MediaStore(mediaDir, store)
     val hub = Hub(store, media, notifier)
 
@@ -130,6 +138,12 @@ fun Application.sorchat(store: Store, notifier: Notifier, mediaDir: File) {
             val found = media.find(call.parameters["id"]!!)
             if (found == null) call.respond(HttpStatusCode.NotFound)
             else call.respond(LocalFileContent(media.file(found), ContentType.parse(found.mimeType)))
+        }
+
+        get("/ice-servers") {
+            val user = call.user()
+            if (user == null) call.respond(HttpStatusCode.Unauthorized)
+            else call.respond(IceServersResponse(ice.serversFor(user.id)))
         }
 
         get("/users/{id}") {

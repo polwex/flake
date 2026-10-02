@@ -24,11 +24,21 @@ import one.yago.sorchat.app.Contact
 fun SorchatApp(vm: ChatViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
     val playback by vm.playback.collectAsStateWithLifecycle()
+    val call by vm.call.collectAsStateWithLifecycle()
     if (state.me != null) RequestNotificationPermission()
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         val me = state.me
         val chat = state.openChat
+        val currentCall = call
         when {
+            currentCall != null -> CallScreen(
+                call = currentCall,
+                onAccept = vm::acceptCall,
+                onDecline = vm::declineCall,
+                onHangUp = vm::hangUp,
+                onMute = vm::setMuted,
+                onSpeaker = vm::setSpeaker,
+            )
             me == null -> RegisterScreen(state, onRegister = vm::register)
             chat != null -> {
                 BackHandler { vm.openChat(null) }
@@ -39,6 +49,7 @@ fun SorchatApp(vm: ChatViewModel = viewModel()) {
                     error = state.error,
                     onDismissError = vm::dismissError,
                     onSend = vm::send,
+                    onCall = vm::startCall,
                     onBack = { vm.openChat(null) },
                     onVisible = vm::setVisibleChat,
                     voice = VoiceControls(

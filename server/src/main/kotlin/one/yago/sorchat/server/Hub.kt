@@ -6,7 +6,9 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
+import one.yago.sorchat.protocol.CallSignal
 import one.yago.sorchat.protocol.ClientFrame
+import one.yago.sorchat.protocol.EndReason
 import one.yago.sorchat.protocol.ProtocolJson
 import one.yago.sorchat.protocol.ServerFrame
 import org.slf4j.LoggerFactory
@@ -77,6 +79,15 @@ class Hub(private val store: Store, private val media: MediaStore, private val n
                 }
             }
             is ClientFrame.Ack -> store.deleteMessage(frame.id, user.id)?.let { media.delete(it) }
+            is ClientFrame.Call -> {
+                val forwarded = sessions[frame.to]
+                    ?.let { runCatching { it.sendFrame(ServerFrame.Call(user.id, user.name, frame.callId, frame.signal)) }.isSuccess }
+                    ?: false
+                if (!forwarded && frame.signal is CallSignal.Invite) {
+                    val callee = store.findUser(frame.to)?.name ?: frame.to
+                    session.sendFrame(ServerFrame.Call(frame.to, callee, frame.callId, CallSignal.End(EndReason.UNAVAILABLE)))
+                }
+            }
         }
     }
 

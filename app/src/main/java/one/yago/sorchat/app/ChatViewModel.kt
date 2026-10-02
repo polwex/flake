@@ -48,6 +48,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val recorder = VoiceRecorder(app)
     private val player = VoicePlayer(viewModelScope)
     val playback: StateFlow<Playback?> = player.state
+    val call: StateFlow<Call?> = repo.calls.call
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private val conversation = local.map { it.openChat }.distinctUntilChanged()
@@ -130,6 +131,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val (file, durationMs) = recording
         viewModelScope.launch { repo.sendVoice(peer, file, durationMs) }
     }
+
+    fun startCall() {
+        val peer = state.value.contacts.firstOrNull { it.id == local.value.openChat } ?: return
+        player.stop()
+        repo.calls.start(peer)
+    }
+
+    fun acceptCall() = repo.calls.accept()
+    fun declineCall() = repo.calls.decline()
+    fun hangUp() = repo.calls.hangUp()
+    fun setMuted(muted: Boolean) = repo.calls.setMuted(muted)
+    fun setSpeaker(on: Boolean) = repo.calls.setSpeaker(on)
 
     fun togglePlayback(message: ChatMessage) {
         try {

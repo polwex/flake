@@ -23,6 +23,11 @@ class Notifications(private val context: Context) {
                 .setName("Messages")
                 .build()
         )
+        manager.createNotificationChannel(
+            NotificationChannelCompat.Builder(CHANNEL_CALLS, NotificationManagerCompat.IMPORTANCE_LOW)
+                .setName("Ongoing calls")
+                .build()
+        )
     }
 
     @SuppressLint("MissingPermission") // checked by canNotify()
@@ -57,7 +62,8 @@ class Notifications(private val context: Context) {
 
     private fun notificationId(contactId: String) = contactId.hashCode()
 
-    private companion object {
-        const val CHANNEL_MESSAGES = "messages"
+    companion object {
+        private const val CHANNEL_MESSAGES = "messages"
+        const val CHANNEL_CALLS = "calls"
     }
 }
